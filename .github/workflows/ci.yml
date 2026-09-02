@@ -90,7 +90,7 @@ jobs:
     needs: [lint, test, docker]
     # One email for CI+CD: on push to main, CD's notify-staging covers CI+CD staging (so silence here to avoid duplicate).
     # This job only emails for PRs where CD does not run.
-    if: always() && github.event_name == 'pull_request'
+    if: always()
     permissions:
       contents: read
       issues: write
