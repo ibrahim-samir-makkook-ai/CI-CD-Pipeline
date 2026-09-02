@@ -10,7 +10,7 @@ def add(a: int, b: int) -> int:
 
 @app.route("/")
 def home() -> tuple[Response, int]:
-    return jsonify(message="Hello, CI/CD Pipeline!"), 200
+    return jsonify(message="Hello, CI/CD Pipeline! test"), 200
 
 
 @app.route("/health")
