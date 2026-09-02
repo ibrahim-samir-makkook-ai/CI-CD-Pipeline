@@ -17,7 +17,7 @@ def test_home_status_code(client):
 def test_home_message(client):
     response = client.get("/")
     data = response.get_json()
-    assert data["message"] == "Hello, CI/CD Pipeline!"
+    assert data["message"] == "Hello, CI/CD Pipeline! test"
 
 
 def test_health(client):
