@@ -111,6 +111,7 @@ jobs:
           host: ${{ secrets.STAGING_HOST }}
           username: ${{ secrets.STAGING_USER }}
           key: ${{ secrets.STAGING_SSH_KEY }}
+          password: ${{ secrets.STAGING_PASSWORD || secrets.STAGING_SSH_PASSWORD }}
           port: ${{ secrets.STAGING_SSH_PORT || 22 }}
           script: |
             set -e
@@ -262,6 +263,7 @@ jobs:
           host: ${{ secrets.PROD_HOST }}
           username: ${{ secrets.PROD_USER }}
           key: ${{ secrets.PROD_SSH_KEY }}
+          password: ${{ secrets.PROD_PASSWORD || secrets.PROD_SSH_PASSWORD || secrets.STAGING_PASSWORD }}
           port: ${{ secrets.PROD_SSH_PORT || 22 }}
           script: |
             set -e

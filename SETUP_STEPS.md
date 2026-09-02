@@ -124,7 +124,9 @@ ssh-copy-id -i ~/.ssh/ci_cd_prod.pub USER@PROD_HOST
 ssh -i ~/.ssh/ci_cd_staging USER@STAGING_HOST "docker ps"
 ```
 
-Private keys (`~/.ssh/ci_cd_staging`, `~/.ssh/ci_cd_prod`) → paste into GitHub Secrets in Step 4. **Never commit keys.**
+Private keys (`~/.ssh/ci_cd_staging`, `~/.ssh/ci_cd_prod`) → paste into GitHub Secrets `STAGING_SSH_KEY`/`PROD_SSH_KEY` in Step 4. **Never commit keys.**
+
+> **Password auth (your case `ibrahem@46.62.229.172`):** If server uses password (no key), skip key generation and instead add secret **`STAGING_PASSWORD`** = your `ibrahem` password for `46.62.229.172` (and `PROD_PASSWORD` if prod same/different). `cd.yml:113` `deploy-staging` now supports `password: ${{ secrets.STAGING_PASSWORD || secrets.STAGING_SSH_PASSWORD }}` as fallback to `key:` — leave `STAGING_SSH_KEY` empty when using password. Key is more secure for long term.
 
 ---
 
@@ -153,12 +155,14 @@ Settings → Secrets and variables → Actions → **New repository secret**:
 | `GHCR_PAT` | PAT from Step 2 | SSH deploy `docker login` |
 | `STAGING_HOST` | `203.0.113.10` | `deploy-staging` `.github/workflows/cd.yml:96` (`if: STAGING_HOST` skip if empty) |
 | `STAGING_USER` | `ubuntu` / `deploy` | SSH user |
-| `STAGING_SSH_KEY` | contents of `~/.ssh/ci_cd_staging` (private PEM) | `appleboy/ssh-action` |
+| `STAGING_SSH_KEY` | contents of `~/.ssh/ci_cd_staging` (private PEM) | `appleboy/ssh-action` `key:` — leave empty if using password |
+| `STAGING_PASSWORD` | password for `ibrahem@46.62.229.172` (your server) | `appleboy/ssh-action` `password:` — **you use this** (fallback `STAGING_SSH_PASSWORD`) |
 | `STAGING_SSH_PORT` | `22` (omit if default) | SSH |
 | `STAGING_PATH` | `/opt/ci-cd-pipeline` | remote `cd` |
 | `PROD_HOST` | `203.0.113.20` | `deploy-production` `.github/workflows/cd.yml:245` (`if: PROD_HOST`) |
 | `PROD_USER` | `ubuntu` / `deploy` | — |
 | `PROD_SSH_KEY` | contents of `~/.ssh/ci_cd_prod` | — |
+| `PROD_PASSWORD` | password for prod host (or reuse `STAGING_PASSWORD`) | `password:` fallback |
 | `PROD_SSH_PORT` | `22` | — |
 | `PROD_PATH` | `/opt/ci-cd-pipeline` | — |
 > Environment secrets alternative: put `STAGING_*` under `staging` environment, `PROD_*` under `production` environment for isolation.
