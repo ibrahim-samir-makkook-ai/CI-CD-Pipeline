@@ -1,22 +1,25 @@
 # CD Setup Steps — Staging Auto-Deploy + Production Approval + GitHub Email Notifications
 
-This guide wires up `.github/workflows/cd.yml:1` (5 jobs) and `.github/workflows/ci.yml:1` (4 jobs) so that **every push to `main` auto-builds & deploys to staging**, **waits for manual approval before promoting/deploying to production**, and **sends GitHub Email (via assigned Issue) to production reviewers on failure (issue+cause) and success (ack)**. Two separate VPS/VMs (SSH) + `concurrency: cancel stale` are used. **No SMTP/Gmail App Password needed** — GitHub sends email to reviewers' registered GitHub email when they are assigned/@mentioned.
+This guide wires up `.github/workflows/cd.yml:1` (6 jobs) and `.github/workflows/ci.yml:1` (4 jobs) so that **every push to `main` auto-builds & deploys to staging**, **waits for manual approval before promoting/deploying to production**, and **sends one simple GitHub Email per phase (minimal with chart)** to production reviewers: **staging combined CI+CD email (failure only) + production email after approval (failure + success ack)**. Two separate VPS/VMs (SSH) + `concurrency: cancel stale` are used. **No SMTP/Gmail App Password needed** — GitHub sends email via assigned Issue.
 
-> Current `cd.yml` implements full flow: `publish-staging` `.github/workflows/cd.yml:11` builds `ghcr.io/...:staging` + `sha-*` and smoke-tests `.github/workflows/cd.yml:68`, `deploy-staging` `.github/workflows/cd.yml:96` auto-deploys to staging VPS via SSH (if `STAGING_HOST` set), `publish-production` `.github/workflows/cd.yml:140` waits on `environment: production` before promoting same digest to `:latest`/`:stable` via `imagetools` with stale guard `.github/workflows/cd.yml:183`, `deploy-production` `.github/workflows/cd.yml:245` auto-deploys to prod VPS after approval (if `PROD_HOST` set), `notify` `.github/workflows/cd.yml:290` creates **GitHub Issue assigned to reviewers** (triggers **GitHub Email**). `ci.yml` has `lint` `.github/workflows/ci.yml:10` → `test` `.github/workflows/ci.yml:36` → `docker` `.github/workflows/ci.yml:57` → `notify` `.github/workflows/ci.yml:88` with same GitHub Issue email. All successes notify (you chose **All successes**).
-> GHCR-only mode still works: if `STAGING_HOST`/`PROD_HOST` secrets are empty, SSH jobs are skipped and pipeline remains green with registry tags only. GitHub Email needs no SMTP secrets — just `issues: write` and production reviewers; if no reviewers, fallback to repo owner.
+> Current `cd.yml` implements full flow: `publish-staging` `.github/workflows/cd.yml:11` builds `ghcr.io/...:staging` + `sha-*` and smoke-tests `.github/workflows/cd.yml:68`, `deploy-staging` `.github/workflows/cd.yml:96` auto-deploys to staging VPS via SSH (if `STAGING_HOST` set), `publish-production` `.github/workflows/cd.yml:140` waits on `environment: production` before promoting same digest to `:latest`/`:stable` via `imagetools` with stale guard `.github/workflows/cd.yml:183`, `deploy-production` `.github/workflows/cd.yml:245` auto-deploys to prod VPS after approval (if `PROD_HOST` set), `notify-staging` `.github/workflows/cd.yml:290` **one email for CI+CD staging** (failure only, minimal table + mermaid, fetches CI `lint/test/docker` via API), `notify-production` `.github/workflows/cd.yml:426` **after approval** (failure + prod success ack, minimal chart). `ci.yml` has `lint` `.github/workflows/ci.yml:10` → `test` `.github/workflows/ci.yml:36` → `docker` `.github/workflows/ci.yml:57` → `notify` `.github/workflows/ci.yml:88` **PR-only** (push to `main` is covered by CD staging email to avoid duplicate). **Policy:** `Failure + prod success` — no staging-success spam.
+> GHCR-only mode still works: if `STAGING_HOST`/`PROD_HOST` secrets are empty, SSH jobs are skipped and pipeline remains green with registry tags only. GitHub Email needs no SMTP secrets — just `issues: write` + `actions: read` (for CI fetch) and production reviewers; if no reviewers, fallback to repo owner.
 
 ```mermaid
 flowchart LR
-  A[git push main] --> B[publish-staging: build+push :staging]
-  B --> C[deploy-staging: SSH staging host - auto]
-  C --> D{publish-production: Waiting approval}
-  D -->|Approve| E[promote :latest/:stable]
-  E --> F[deploy-production: SSH prod host - auto after approve]
-  F --> G[notify: GitHub Issue → Email to reviewers]
-  B --> G
-  D -->|Reject/timeout| G
-  A2[new push while waiting] --> H[cancel stale production run]
-  I[lint/test/docker] --> G
+  A[git push main] --> B[CI: lint/test/docker]
+  B --> C[CD: publish-staging/deploy-staging]
+  C --> D{CI+Staging OK?}
+  D -->|❌ fails| E[notify-staging: One Email for CI+CD<br/>Table + mermaid + cause]
+  D -->|✅ green| F[No staging email<br/>silent per Failure+prod success]
+  F --> G{publish-production: Waiting approval}
+  E --> G
+  G -->|Approve| H[promote + deploy-production]
+  H --> I{Prod OK?}
+  I -->|❌| J[notify-production: Prod Failure]
+  I -->|✅| K[notify-production: Prod Success ack<br/>Table + chart + digest]
+  I -->|cancelled| L[No email]
+  M[PR event] --> N[CI notify: PR-only minimal]
 ```
 
 ---
@@ -183,7 +186,7 @@ Jobs mask secrets. Never `echo ${{ secrets.* }}` without masking. Deploy pipes `
 
 ## 5. How Workflows Work Today
 
-### 5.1 `cd.yml` (5 jobs)
+### 5.1 `cd.yml` (6 jobs — one email per phase)
 
 | Job | File | Trigger | What it does |
 |---|---|---|---|
@@ -191,16 +194,17 @@ Jobs mask secrets. Never `echo ${{ secrets.* }}` without masking. Deploy pipes `
 | `deploy-staging` | `.github/workflows/cd.yml:96` | `needs: publish-staging` + `if: STAGING_HOST` + `environment: staging` | SSH to `STAGING_HOST` (separate VPS) → `docker login ghcr.io` + `TAG=staging docker compose pull/up` + `curl /health` (auto). Skipped if `STAGING_HOST` empty → GHCR-only |
 | `publish-production` | `.github/workflows/cd.yml:140` | `needs: publish-staging` + `environment: production` + `concurrency: production/cancel:true` | **Approval gate** — pauses `Waiting for approval` → stale guard `.github/workflows/cd.yml:183` → `imagetools create --tag :latest/:stable @digest` (no rebuild) |
 | `deploy-production` | `.github/workflows/cd.yml:245` | `needs: publish-production` + `if: PROD_HOST` | SSH to `PROD_HOST` → `TAG=stable docker compose pull/up` + healthcheck. Auto after approval, **no second approval** (no protected env). Skipped if `PROD_HOST` empty |
-| `notify` | `.github/workflows/cd.yml:290` | `needs: [publish-staging, deploy-staging, publish-production, deploy-production]` `if: always()` `permissions: issues: write` | **GitHub Issue (email)** to reviewers: failure → `❌` Issue+cause assigned + `@mention`, success → `✅` ack Issue auto-closed. Uses `actions/github-script@v7` to resolve `production` reviewers → `github.rest.issues.create`. No SMTP |
+| `notify-staging` | `.github/workflows/cd.yml:290` | `needs: [publish-staging, deploy-staging]` `if: always()` `permissions: issues: write, actions: read` | **One email for CI+CD staging** (failure only, per `Failure + prod success`): fetches CI `lint/test/docker` via API `listWorkflowRuns(head_sha)` + `listJobsForWorkflowRun`, builds **minimal table + mermaid chart** (`lint→test→docker→staging_build→staging_deploy`), `labels: ['staging-failure','notify']` → GitHub email. Success → silent (`::notice`) |
+| `notify-production` | `.github/workflows/cd.yml:426` | `needs: [publish-production, deploy-production]` `if: always()` `permissions: issues: write` | **After approval**: failure → `❌` Issue (`prod-failure`), success → `✅` ack auto-closed (`prod-success`), minimal table `promote/deploy` + mermaid `promote→deploy` + `digest`/`rollback`. **Failure + prod success** policy |
 
-### 5.2 `ci.yml` (4 jobs)
+### 5.2 `ci.yml` (4 jobs — PR-only notify)
 
 | Job | File | Trigger | What it does |
 |---|---|---|---|
 | `lint` | `.github/workflows/ci.yml:10` | `push/PR to main` `.github/workflows/ci.yml:4` | `ruff check .` + `ruff check --select ANN` + `ruff format --check` |
 | `test` | `.github/workflows/ci.yml:36` | same | `pytest -v` 5 tests |
 | `docker` | `.github/workflows/ci.yml:57` | `needs: [lint, test]` | `docker build` + `curl /health` smoke |
-| `notify` | `.github/workflows/ci.yml:88` | `needs: [lint, test, docker]` `if: always()` `permissions: issues: write` | **GitHub Issue (email)** to same reviewers: `lint` fail → `ruff`, `test` → `pytest`, `docker` → `curl /health`. Success → `✅` ack auto-closed |
+| `notify` | `.github/workflows/ci.yml:88` | `needs: [lint, test, docker]` `if: always() && github.event_name == 'pull_request'` `permissions: issues: write` | **PR-only minimal** (push to `main` covered by CD staging email to avoid duplicate): failure → `❌` Issue `ci-failure`, success silent for push. Minimal table + mermaid |
 
 Key guarantees:
 - **Build once**: `latest`/`stable` are same bytes as `staging` (`digest` `.github/workflows/cd.yml:23`)
@@ -214,57 +218,35 @@ Key guarantees:
 
 ## 6. `cd.yml` Deploy & Notify Jobs — Already Implemented (reference)
 
-> **Status: Done** — `cd.yml` already contains `deploy-staging` `.github/workflows/cd.yml:96`, `deploy-production` `.github/workflows/cd.yml:245` (`appleboy/ssh-action@v1`, `concurrency: cancel stale`, `if: secrets.*_HOST != ''`), and `notify` `.github/workflows/cd.yml:290` (`actions/github-script@v7` → `github.rest.issues.create` → GitHub Email). Same pattern in `ci.yml:88` (`permissions: issues: write`). No SMTP.
+> **Status: Done** — `cd.yml` now has `deploy-staging` `.github/workflows/cd.yml:96`, `deploy-production` `.github/workflows/cd.yml:245` (`appleboy/ssh-action@v1`, `concurrency: cancel stale`, `if: secrets.*_HOST != ''`), plus **one email per phase**: `notify-staging` `.github/workflows/cd.yml:290` (CI+CD staging, failure only) and `notify-production` `.github/workflows/cd.yml:426` (after approval, failure + success ack), both `permissions: issues: write` (+ `actions: read` for staging to fetch CI). `ci.yml:88` is **PR-only** to avoid duplicate on `main` push.
 
-Reference `deploy-staging` (auto, no approval):
+Reference `notify-staging` (one email for CI+CD, minimal visual):
 ```yaml
-  deploy-staging:
+  notify-staging:
     runs-on: ubuntu-latest
-    needs: publish-staging
-    if: ${{ secrets.STAGING_HOST != '' }}
-    concurrency:
-      group: staging-deploy-${{ github.ref }}
-      cancel-in-progress: true
-    environment:
-      name: staging
-      url: http://${{ secrets.STAGING_HOST }}:5000
+    needs: [publish-staging, deploy-staging]  # plus CI fetched via API
+    if: always()
+    permissions: { contents: read, issues: write, actions: read }
     steps:
-      - uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.STAGING_HOST }}
-          username: ${{ secrets.STAGING_USER }}
-          key: ${{ secrets.STAGING_SSH_KEY }}
-          port: ${{ secrets.STAGING_SSH_PORT || 22 }}
-          script: |
-            set -e
-            IMAGE=$(echo "ghcr.io/${{ github.repository }}:staging" | tr '[:upper:]' '[:lower:]')
-            TOKEN="${{ secrets.GHCR_PAT }}"; [ -z "$TOKEN" ] && TOKEN="${{ secrets.GITHUB_TOKEN }}"
-            echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-            docker pull "$IMAGE"
-            cd "${{ secrets.STAGING_PATH || '/opt/ci-cd-pipeline' }}"
-            TAG=staging docker compose pull && TAG=staging docker compose up -d
-            for i in $(seq 1 15); do curl --fail http://localhost:5000/health && break || sleep 2; done
+      - id: reviewers  # GET /environments/production → logins
+      - id: ci  # listWorkflowRuns(workflow_id: 'ci.yml', head_sha) → lint/test/docker
+      - id: msg  # Python builds minimal table + mermaid: lint→test→docker→staging_build→staging_deploy
+      - if: is_failure  # labels: ['staging-failure','notify'] → GitHub email
+      - if: is_success → silent (::notice) per Failure+prod success
 ```
 
-Reference `notify` (GitHub Issue → Email, no SMTP):
+Reference `notify-production` (after approval):
 ```yaml
-  notify:
+  notify-production:
     runs-on: ubuntu-latest
-    needs: [publish-staging, deploy-staging, publish-production, deploy-production]
+    needs: [publish-production, deploy-production]
     if: always()
     permissions: { contents: read, issues: write }
     steps:
-      - id: reviewers  # GET /repos/.../environments/production → logins
-        uses: actions/github-script@v7
-      - id: msg  # Python builds subject/body from toJson(needs), causes per failed job
-        # publish-staging: build/smoke cd.yml:68
-        # deploy-staging: SSH cd.yml:109
-        # publish-production: stale guard cd.yml:183 / imagetools
-        # deploy-production: SSH cd.yml:259
-      - if: is_failure
-        uses: actions/github-script@v7  # issues.create {assignees: logins, labels: ['cd-failure','notify']} → GitHub emails reviewers
-      - if: is_success
-        uses: actions/github-script@v7  # issues.create then issues.update state:closed → ack email, no spam
+      - id: reviewers
+      - id: msg  # table: promote/deploy + mermaid promote→deploy + digest/rollback
+      - if: is_failure → labels ['prod-failure','notify']
+      - if: is_success → labels ['prod-success','notify'] + auto-close
 ```
 
 Optional strict mode — gate promotion on staging host health (currently `publish-production` uses `needs: publish-staging` only for GHCR-only fallback). To enforce staging SSH must succeed before promotion, change to:
@@ -277,55 +259,63 @@ Optional strict mode — gate promotion on staging host health (currently `publi
 
 ---
 
-## 7. Verify End-to-End
+## 7. Verify End-to-End (one email per phase, minimal)
 
 ```bash
-# 7.1 Push to main (triggers CD + CI)
+# 7.1 Push to main (triggers CI + CD)
 git checkout main && git pull
 echo "# test $(date)" >> README.md
-git commit -am "chore: trigger CD staging" && git push origin main
+git commit -am "chore: trigger staging" && git push origin main
 
 # 7.2 Watch in GitHub
 # Actions → CD Pipeline → run →
 #   publish-staging ✅ (logs: "Staging pushed: ..." + digest)
 #   deploy-staging ✅ (or skipped if GHCR-only)
+#   notify-staging ⏭️ silent if CI+Staging green (Failure+prod success) — no email
 #   publish-production ⏸  "Waiting for approval" (yellow)
-#   notify ⏳ waiting for production (runs after approve/reject)
 
-# 7.3 While waiting, push again to test cancel-stale
+# 7.2b Staging failure → one email for CI+CD (minimal with chart)
+# Break lint or test: echo "import os" >> app.py && git commit -am "break" && git push
+# → notify-staging creates [Staging] ❌ Failure Issue with table:
+#   | CI lint | ❌ failure | | CI test | ✅ | | Staging build | ✅ |
+#   ```mermaid flowchart LR lint-->test-->docker-->staging```
+#   Assigned to production reviewers → GitHub emails
+
+# 7.3 While waiting for approval, push again to test cancel-stale
 echo "# second $(date)" >> README.md
 git commit -am "chore: trigger cancel stale" && git push origin main
 # Previous waiting run → "Canceled" due to concurrency:production/cancel:true
-# notify for cancelled run logs ⚠️ Cancelled, no ❌ email
+# notify-staging/production for cancelled run logs ⚠️ Cancelled, no email
 
-# 7.4 Approve latest run
+# 7.4 Approve latest run (production)
 # Actions → latest run → Review deployments → production → Approve
 
 # After approve:
 #   Promote step: "Creating tag: ...:latest -> ...@sha256:..."
 #   deploy-production pulls :stable and curl /health
-#   notify → GitHub Issue [CD] ✅ Success assigned to reviewers → GitHub emails them (auto-closed)
+#   notify-production → [Prod] ✅ Success Issue (auto-closed) with minimal table:
+#     | Prod promote | ✅ | | Prod deploy | ✅ |
+#     ```mermaid flowchart LR promote-->deploy```
+#     Digest + rollback + CC @reviewers → GitHub emails reviewers
 
-# 7.5 Check hosts
+# 7.5 Check hosts & GHCR
 ssh $STAGING_USER@$STAGING_HOST "docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'; curl -s http://localhost:5000/health"
-ssh $PROD_USER@$PROD_HOST "docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'; curl -s http://localhost:5000/health"
-
-# 7.6 Check GHCR tags
 docker buildx imagetools inspect ghcr.io/isamir0/ci-cd-pipeline-test:staging | grep -i digest
-docker buildx imagetools inspect ghcr.io/isamir0/ci-cd-pipeline-test:stable | grep -i digest
 
-# 7.7 GitHub Email verify
-# Actions → run → notify → logs: logins=..., Created issue #N
-# Issues → #N (assigned to reviewers) → reviewers get GitHub email (check inbox/Spam, Watch → Issues ON)
-# Success issues auto-closed after creation (ack) but email already sent
+# 7.6 GitHub Email verify
+# Actions → run → notify-staging / notify-production → logs: logins=..., Created issue #N
+# Issues → #N (labels: staging-failure / prod-success, notify) → reviewers get GitHub email (Watch → Issues ON)
 
-# 7.8 CI verify (all successes path)
-git commit --allow-empty -m "chore: test CI notify" && git push origin main
-# Actions → CI Pipeline → notify → [CI] ✅ Success Issue auto-closed, email to reviewers
+# 7.7 PR verify (PR-only CI email)
+# Create PR: git checkout -b feature/x && git push -u origin feature/x && gh pr create --fill
+# → CI Pipeline → notify (PR-only) → [CI] ❌ only on PR failure (minimal)
 
-# 7.9 Trigger failure to test issue+cause
-# Lint fail: echo "import os" >> app.py && git commit -am "break lint" && git push  # → [CI] ❌ lint failed: ruff
-# CD staging fail: edit app.py:16 to return 500, push → deploy-staging health fails → [CD] ❌ deploy-staging
+# 7.8 Prod failure test
+# Break prod health: edit prod docker-compose to bad image, push, approve → [Prod] ❌ Failure issue with cause
+
+# 7.9 Endpoints
+curl https://STAGING_HOST:5000/health || curl http://STAGING_HOST:5000/health
+curl https://PROD_HOST:5000/health
 ```
 
 ---
@@ -377,98 +367,94 @@ EOS
 
 ---
 
-## 10. GitHub Email Notifications (CI + CD) — Failure (issue+cause) & Success Ack
+## 10. GitHub Email Notifications — One Simple Email for CI+CD (Minimal + Chart)
 
-Failure sends **GitHub Issue (triggers GitHub email)** with issue+cause, success sends **ack Issue (auto-closed)** to **production reviewers** (GitHub logins → email via GitHub), for both `ci.yml` and `cd.yml` (you chose `All successes`). **No SMTP/Gmail secrets needed** — uses `GITHUB_TOKEN` + `issues: write` to create assigned Issues; GitHub emails assignees/mentioned users at their registered GitHub email if they have **Watch** and **Email notifications** enabled.
+Policy: **Failure + prod success** — staging combined CI+CD email only on failure (silent on staging success); production email after approval on both failure and success ack. **One email for CI+CD staging** = CI `lint/test/docker` + CD `publish-staging/deploy-staging` in same Issue table + mermaid. GitHub Issue triggers email (no SMTP).
 
 ### 10.1 How GitHub Email Works (no SMTP)
 
-* GitHub sends email automatically when a user is **assigned** to an Issue or **@mentioned** in Issue body, if that user has: `Settings → Notifications → Email` enabled and repo `Watch → Custom → Issues` or `All Activity`.
-* `notify` jobs resolve reviewers via **API** `GET /repos/{owner}/{repo}/environments/production` → `protection_rules[].reviewers` (the same users in `environment: production` Required reviewers `.github/workflows/cd.yml:140`). Falls back to repo owner if none.
-* Then creates a **GitHub Issue** assigned to those logins with labels `ci-failure`/`cd-failure` or `ci-success`/`cd-success` + `notify`. Assignees get email. Success issues are auto-closed after creation (ack) but email already delivered.
+* GitHub emails when user is **assigned** or **@mentioned** in Issue, if `Settings → Notifications → Email` ON + repo `Watch → Custom → Issues`.
+* Jobs resolve reviewers via `GET /repos/{owner}/{repo}/environments/production` → `protection_rules[].reviewers` (same as `environment: production` gate `.github/workflows/cd.yml:140`), fallback to repo owner.
+* Creates Issue with labels `staging-failure` / `prod-failure` / `prod-success` / `ci-failure` + `notify` + `CC @logins` in body. Success issues auto-closed after creation (email already sent).
 
-### 10.2 No Secrets Needed (vs Gmail)
+### 10.2 No Secrets Needed
 
-| Secret/Variable | Before (Gmail) | Now (GitHub Email) |
+| Secret | Before (Gmail SMTP) | Now (GitHub Email) |
 |---|---|---|
-| `GMAIL_USER` / `SMTP_USER` / `GMAIL_APP_PASSWORD` / `SMTP_PASSWORD` / `MAIL_FROM` / `SMTP_HOST` | Required | **Not needed — delete** |
-| `MAIL_TO_FALLBACK` / `REVIEWER_EMAIL_MAP` | Required | **Not needed — uses GitHub logins directly** |
-| `GITHUB_TOKEN` | Already present | Requires `permissions: issues: write` (added to `notify` jobs `.github/workflows/cd.yml:290` and `.github/workflows/ci.yml:88`) |
+| `GMAIL_USER`/`SMTP_*`/`MAIL_FROM` | Required | **Not needed — delete** |
+| `MAIL_TO_FALLBACK`/`REVIEWER_EMAIL_MAP` | Required | **Not needed — uses GitHub logins** |
+| `GITHUB_TOKEN` | Already present | Requires `permissions: issues: write` (+ `actions: read` for staging to fetch CI) — present in `notify-staging` `.github/workflows/cd.yml:290` / `notify-production` `.github/workflows/cd.yml:426` / PR `notify` `.github/workflows/ci.yml:88` |
 
-If you previously added Gmail secrets, you can keep them (ignored) or remove via `gh secret remove`.
+### 10.3 How Notify Jobs Work Now (minimal visual)
 
-### 10.3 How Notify Jobs Work Now
+* **`ci.yml:88` PR-only** `needs: [lint, test, docker]` `if: always() && github.event_name == 'pull_request'` `permissions: issues: write`:
+  * Resolves reviewers → builds **minimal** `| Stage | Status |` table (3 rows) + ````mermaid flowchart LR lint-->test-->docker```` → `is_failure` → `labels: ['ci-failure','notify']` (PR failure only). Push to `main` silent — covered by CD staging.
+  * Subject `[CI] ❌ Failure sha — lint,test` (failure) — no verbose JSON.
 
-* `ci.yml:88` `notify` `needs: [lint, test, docker]` `if: always()` `permissions: issues: write`:
-  * `actions/github-script@v7` resolves `production` reviewers → `logins`
-  * Python builds `subject`/`body` from `toJson(needs)`:
-    * `lint` fail → `ruff check/format (ci.yml:27)`
-    * `test` fail → `pytest -v (ci.yml:54)`
-    * `docker` fail → `curl /health (ci.yml:67)`
-    * success → `✅ Success — CI passed` | cancelled → `⚠️ Cancelled`
-  * `is_failure` → `github.rest.issues.create({title, body + CC @logins, assignees: logins, labels: ['ci-failure','notify']})` — triggers email
-  * `is_success` → same with `labels: ['ci-success','notify']` then auto-close `issues.update({state:'closed'})` (email already sent)
+* **`cd.yml:290` `notify-staging`** `needs: [publish-staging, deploy-staging]` `if: always()` `permissions: issues: write, actions: read`:
+  * Steps: `resolve reviewers` → `fetch CI status` (`listWorkflowRuns(workflow_id: 'ci.yml', per_page:10)` filtered by `head_sha` → `listJobsForWorkflowRun` → `lint/test/docker` conclusions) → `build minimal` Python:
+    * Table 5 rows: `CI lint | ✅/❌ | CI test | ... | Staging build/deploy`
+    * Mermaid `flowchart LR lint-->test-->docker-->staging_build-->staging_deploy` with fail highlights
+    * Causes: 1 line per failed job (`lint: ruff`, `test: pytest`, `staging build: smoke`, `staging deploy: SSH`)
+  * `is_failure` → `labels: ['staging-failure','notify']` → GitHub email | `is_success` → silent `::notice` (per `Failure + prod success`).
 
-* `cd.yml:290` `notify` `needs: [publish-staging, deploy-staging, publish-production, deploy-production]` `if: always()` `permissions: issues: write`:
-  * Same resolver
-  * Causes: `publish-staging` fail → build/smoke `cd.yml:68`, `deploy-staging` → SSH `cd.yml:109`, `publish-production` → stale guard `cd.yml:183`/imagetools, `deploy-production` → SSH `cd.yml:259`, `cancelled` stale → `⚠️` not `❌`, success → digest `needs.publish-staging.outputs.digest` + rollback cmd
-  * Failure → `labels: ['cd-failure','notify']` assigned issue (email)
-  * Success → `labels: ['cd-success','notify']` then auto-closed (ack email, no issue spam)
+* **`cd.yml:426` `notify-production`** `needs: [publish-production, deploy-production]` `if: always()`:
+  * Minimal table 2 rows `Prod promote | ✅ | Prod deploy | ✅` + `mermaid flowchart LR promote-->deploy` + `digest` (if available) + `rollback` on success
+  * `is_failure` → `labels: ['prod-failure','notify']` | `is_success` → `labels: ['prod-success','notify']` auto-closed | `is_cancelled` → no email.
 
-Labels are created on first run if repo has no `notify` labels; if creation fails without labels, job retries without labels.
+All bodies ~15 lines vs previous ~30, no `Results: JSON` dump, no `Reviewers (GitHub):` block — just table + chart + cause + link.
 
-### 10.4 Verify GitHub Email
+### 10.4 Verify GitHub Email (one email per phase)
 
 ```bash
-# 1. No secrets needed — just ensure production reviewers set
-gh api repos/${{ github.repository }}/environments/production --jq '.protection_rules'
+# 1. No secrets — ensure reviewers set
+gh api repos/OWNER/REPO/environments/production --jq '.protection_rules[].reviewers'
 
-# 2. Trigger CI success → expect CI success Issue + email
-git commit --allow-empty -m "chore: test CI notify" && git push origin main
-# Actions → CI Pipeline → notify → logs: logins=..., Created CI success issue #N
-# Issues → #N closed with `ci-success` label, reviewers assigned → check GitHub email inbox
+# 2. Staging failure (one email for CI+CD) → expect [Staging] ❌
+echo "import os" >> app.py; git commit -am "break lint" && git push origin main
+# Actions → notify-staging → logs: CI lint ❌ + staging, Created issue #N with table + mermaid, assigned → email
+# Staging success → notify-staging logs "Staging passed — no email (silent)" — no Issue
 
-# 3. Trigger CI failure → expect failure Issue
-echo "import os" >> app.py; git commit -am "break lint" && git push  # → [CI] ❌ Failure issue assigned, email sent
+# 3. Production success ack → push green, approve prod
+git commit --allow-empty -m "fix" && git push origin main
+# approve in Actions → notify-production → [Prod] ✅ Success Issue auto-closed + digest → email
 
-# 4. Trigger CD failure (staging health)
-# edit app.py:16 to return 500, push → deploy-staging fails → [CD] ❌ issue with cause
+# 4. PR: git checkout -b feature/x && gh pr create → CI notify PR-only → [CI] ❌ only on PR failure
 
-# 5. Trigger CD success ack → fix, push, approve prod → [CD] ✅ Success issue auto-closed, email to reviewers
-# Check reviewers' GitHub notification email (and Watch settings)
-# Issues → filter label:notify → see history
-
-# 6. Cancelled stale: push twice fast while publish-production waiting → ⚠️ Cancelled — logged, no email
+# 5. Cancelled stale: push twice fast → ⚠️ Cancelled — logged, no email
+# Issues → filter label:notify → 1 prod success Issue per main push (not 2)
 ```
 
 ### 10.5 Troubleshooting GitHub Email
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| No email received but Issue created | Reviewer has Email notifications disabled or not Watching repo | Reviewer: `Settings → Notifications → Email` ON, repo `Watch → Custom → Issues` ON, check Spam |
-| `No reviewers resolved` → fallback to owner | `production` environment has no Required reviewers | Add reviewers: Settings → Environments → production → Required reviewers |
-| `getEnvironment failed 404` | Env `production` not created | Create env first |
-| Issue labels `cd-failure` not found | Repo has no label | Job auto-retries without labels; manually create `cd-failure`, `cd-success`, `ci-failure`, `ci-success`, `notify` via `gh label create` |
-| `Resource not accessible by integration` | `notify` missing `issues: write` | Ensure job has `permissions: issues: write` (present in both workflows) |
-| Success spam noisy | `All successes` chosen | Filter: add `if: github.ref=='refs/heads/main'` on success issue step, or disable success ack by removing that step |
+| No email but Issue created | Watch/Email OFF | Reviewer: `Settings → Notifications → Email` ON, repo `Watch → Custom → Issues` ON, check Spam |
+| `No reviewers` → owner fallback | No Required reviewers | Add reviewers to `production` env |
+| `getEnvironment 404` | Env missing | Create `production` env |
+| Labels missing | Repo has no label | Job retries without labels; `gh label create staging-failure --color FF0000` |
+| `Resource not accessible` | Missing `issues: write` / `actions: read` | Check job permissions (present) |
+| CI status `skipped` in staging table | CI not found for sha yet (race) | Staging fetch retries; check `GITHUB_RUN_ID`/`head_sha` mismatch; re-run workflow |
+| Want staging success email too | Current `Failure + prod success` silences it | Change `notify-staging` second step to also handle `is_success` → create `staging-success` auto-closed |
 
-## 11. Quick Checklist
+## 11. Quick Checklist (one email per phase)
 
 - [ ] Hosts: `docker` + `docker compose` installed, `/opt/ci-cd-pipeline/docker-compose.yml` present (`${TAG:-staging}`)
 - [ ] GHCR PAT `read:packages`, secrets `GHCR_PAT` set
 - [ ] SSH keys `authorized_keys`, secrets `*_SSH_KEY` set
 - [ ] Environments `staging` (auto) + `production` (Required reviewers = 1) created
 - [ ] Secrets `*_HOST`, `*_USER`, `*_PATH` set
-- [ ] **GitHub Email notify:** no SMTP secrets — just `production` reviewers + `permissions: issues: write` in `notify` jobs; ensure reviewers have `Watch → Issues` + `Email` ON
-- [ ] Push to `main` → staging green → `publish-production` waits → Approve → prod green + `notify` creates `✅ Success` Issue (auto-closed) → **GitHub emails** reviewers
-- [ ] Break `lint`/`test`/`docker` or staging deploy → `notify` creates `❌ Failure` Issue assigned + `@mention` → **GitHub emails** reviewers with issue+cause
+- [ ] **GitHub Email notify:** `permissions: issues: write` (+ `actions: read` for staging) in `notify-staging` `.github/workflows/cd.yml:290` / `notify-production` `.github/workflows/cd.yml:426` / PR `notify` `.github/workflows/ci.yml:88`; reviewers `Watch → Issues` + `Email` ON; labels `staging-failure`/`prod-success` exist (or auto-created)
+- [ ] Push to `main` green → **no staging email** (silent) → Approve → `notify-production` → `✅ Success` auto-closed Issue with minimal table + mermaid + digest → **one prod email**
+- [ ] Break CI `lint` or staging `deploy-staging` → `notify-staging` → **one `[Staging] ❌` Issue** (CI+CD table + chart + cause) → **email**; prod not reached
+- [ ] Break `publish-production`/`deploy-production` → `notify-production` → `[Prod] ❌` Issue → email
 - [ ] `docker compose config` with `TAG=staging` → `:staging`, `TAG=stable` → `:stable`
 
 ---
 
 ## References
 
-- CD workflow: `.github/workflows/cd.yml:1`, staging `publish-staging` `.github/workflows/cd.yml:11`, `deploy-staging` `.github/workflows/cd.yml:96`, prod `publish-production` `.github/workflows/cd.yml:140`, `deploy-production` `.github/workflows/cd.yml:245`, `notify` `.github/workflows/cd.yml:290`
-- CI workflow: `.github/workflows/ci.yml:1`, `lint` `.github/workflows/ci.yml:10`, `test` `.github/workflows/ci.yml:36`, `docker` `.github/workflows/ci.yml:57`, `notify` `.github/workflows/ci.yml:88`
+- CD workflow: `.github/workflows/cd.yml:1`, staging `publish-staging` `.github/workflows/cd.yml:11`, `deploy-staging` `.github/workflows/cd.yml:96`, prod `publish-production` `.github/workflows/cd.yml:140`, `deploy-production` `.github/workflows/cd.yml:245`, `notify-staging` `.github/workflows/cd.yml:290` (one email for CI+CD, failure only), `notify-production` `.github/workflows/cd.yml:426` (after approval, failure + success)
+- CI workflow: `.github/workflows/ci.yml:1`, `lint` `.github/workflows/ci.yml:10`, `test` `.github/workflows/ci.yml:36`, `docker` `.github/workflows/ci.yml:57`, `notify` `.github/workflows/ci.yml:88` (PR-only, push to main covered by CD staging)
 - App: `app.py:16` (`/health`), `Dockerfile:20`, `docker-compose.yml:6` (`${TAG:-staging}`)
 - CI docs: `PIPELINE.md:1`, `CI_CD_SIMPLE.md:1`, `README.md:1`
