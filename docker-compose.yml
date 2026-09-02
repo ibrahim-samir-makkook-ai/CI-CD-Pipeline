@@ -5,7 +5,7 @@ services:
     #   TAG=staging docker compose pull && TAG=staging docker compose up -d  (staging host)
     #   TAG=stable  docker compose pull && TAG=stable  docker compose up -d  (prod host)
     build: .
-    image: ghcr.io/isamir0/ci-cd-pipeline-test:${TAG:-staging}
+    image: ghcr.io/ibrahim-samir-makkook-ai/ci-cd-pipeline:${TAG:-staging}
     ports:
       - "5000:5000"
     container_name: ci-cd-pipeline-test

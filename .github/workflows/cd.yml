@@ -153,7 +153,19 @@ jobs:
             echo "$TOKEN" | $DOCKER login ghcr.io -u "${{ github.actor }}" --password-stdin
             echo "Pulling $IMAGE"
             $DOCKER pull "$IMAGE"
-            cd "${{ secrets.STAGING_PATH || '/opt/ci-cd-pipeline' }}"
+            STAGING_PATH="${{ secrets.STAGING_PATH || '/opt/ci-cd-pipeline' }}"
+            [ -z "$STAGING_PATH" ] && STAGING_PATH="/opt/ci-cd-pipeline"
+            mkdir -p "$STAGING_PATH" 2>/dev/null || ( [ -n "$SUDO_PASS" ] && echo "$SUDO_PASS" | sudo -S mkdir -p "$STAGING_PATH" && echo "$SUDO_PASS" | sudo -S chown $USER:$USER "$STAGING_PATH" )
+            cd "$STAGING_PATH"
+            echo "Staging path: $(pwd) (STAGING_PATH=$STAGING_PATH) contents:"
+            ls -la | head -30 || true
+            if [ ! -f docker-compose.yml ] && [ ! -f compose.yml ] && [ ! -f compose.yaml ]; then
+              echo "docker-compose.yml missing in $STAGING_PATH — creating template"
+              printf '%s\n' 'services:' '  app:' '    image: ghcr.io/ibrahim-samir-makkook-ai/ci-cd-pipeline:${TAG:-staging}' '    ports: ["5000:5000"]' '    container_name: ci-cd-pipeline-test' '    restart: unless-stopped' '    healthcheck:' '      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('\''http://localhost:5000/health'\'')"]' '      interval: 10s' '      timeout: 3s' '      retries: 3' '      start_period: 5s' > docker-compose.yml
+              echo "Created docker-compose.yml:"
+              cat docker-compose.yml
+            fi
+            $COMPOSE config >/dev/null && echo "compose valid" || (echo "::error::compose invalid"; cat docker-compose.yml || true; exit 1)
             echo "Deploying with docker compose"
             TAG=staging $COMPOSE pull
             TAG=staging $COMPOSE up -d
@@ -332,7 +344,19 @@ jobs:
             echo "$TOKEN" | $DOCKER login ghcr.io -u "${{ github.actor }}" --password-stdin
             echo "Pulling $IMAGE"
             $DOCKER pull "$IMAGE"
-            cd "${{ secrets.PROD_PATH || '/opt/ci-cd-pipeline' }}"
+            PROD_PATH="${{ secrets.PROD_PATH || '/opt/ci-cd-pipeline' }}"
+            [ -z "$PROD_PATH" ] && PROD_PATH="/opt/ci-cd-pipeline"
+            mkdir -p "$PROD_PATH" 2>/dev/null || ( [ -n "$SUDO_PASS" ] && echo "$SUDO_PASS" | sudo -S mkdir -p "$PROD_PATH" && echo "$SUDO_PASS" | sudo -S chown $USER:$USER "$PROD_PATH" )
+            cd "$PROD_PATH"
+            echo "Prod path: $(pwd) (PROD_PATH=$PROD_PATH) contents:"
+            ls -la | head -30 || true
+            if [ ! -f docker-compose.yml ] && [ ! -f compose.yml ] && [ ! -f compose.yaml ]; then
+              echo "docker-compose.yml missing in $PROD_PATH — creating template"
+              printf '%s\n' 'services:' '  app:' '    image: ghcr.io/ibrahim-samir-makkook-ai/ci-cd-pipeline:${TAG:-stable}' '    ports: ["5000:5000"]' '    container_name: ci-cd-pipeline-test' '    restart: unless-stopped' '    healthcheck:' '      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('\''http://localhost:5000/health'\'')"]' '      interval: 10s' '      timeout: 3s' '      retries: 3' '      start_period: 5s' > docker-compose.yml
+              echo "Created docker-compose.yml:"
+              cat docker-compose.yml
+            fi
+            $COMPOSE config >/dev/null && echo "compose valid" || (echo "::error::compose invalid"; cat docker-compose.yml || true; exit 1)
             echo "Deploying production with docker compose"
             TAG=stable $COMPOSE pull
             TAG=stable $COMPOSE up -d
