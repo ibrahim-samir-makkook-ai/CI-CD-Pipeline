@@ -166,9 +166,14 @@ jobs:
               cat docker-compose.yml
             fi
             $COMPOSE config >/dev/null && echo "compose valid" || (echo "::error::compose invalid"; cat docker-compose.yml || true; exit 1)
-            echo "Deploying with docker compose"
+            echo "Deploying with docker compose (cleaning stale port 5000)"
+            # Clean previous compose project and orphan ci-cd-pipeline-test (fixes Bind 0.0.0.0:5000 failed: port is already allocated)
+            TAG=staging $COMPOSE down 2>/dev/null || true
+            $DOCKER rm -f ci-cd-pipeline-test 2>/dev/null || echo "$SUDO_PASS" | sudo -S docker rm -f ci-cd-pipeline-test 2>/dev/null || true
+            $DOCKER ps -q --filter publish=5000 | xargs -r $DOCKER rm -f 2>/dev/null || $DOCKER ps -q --filter publish=5000 | xargs -r echo "$SUDO_PASS" | sudo -S docker rm -f 2>/dev/null || true
+            echo "$SUDO_PASS" | sudo -S fuser -k 5000/tcp 2>/dev/null || sudo -n fuser -k 5000/tcp 2>/dev/null || true
             TAG=staging $COMPOSE pull
-            TAG=staging $COMPOSE up -d
+            TAG=staging $COMPOSE up -d --remove-orphans
             echo "Waiting for /health..."
             for i in $(seq 1 15); do
               if curl --fail http://localhost:5000/health; then echo "Staging health OK"; break; fi
@@ -357,9 +362,13 @@ jobs:
               cat docker-compose.yml
             fi
             $COMPOSE config >/dev/null && echo "compose valid" || (echo "::error::compose invalid"; cat docker-compose.yml || true; exit 1)
-            echo "Deploying production with docker compose"
+            echo "Deploying production with docker compose (cleaning stale port 5000)"
+            TAG=stable $COMPOSE down 2>/dev/null || true
+            $DOCKER rm -f ci-cd-pipeline-test 2>/dev/null || echo "$SUDO_PASS" | sudo -S docker rm -f ci-cd-pipeline-test 2>/dev/null || true
+            $DOCKER ps -q --filter publish=5000 | xargs -r $DOCKER rm -f 2>/dev/null || $DOCKER ps -q --filter publish=5000 | xargs -r echo "$SUDO_PASS" | sudo -S docker rm -f 2>/dev/null || true
+            echo "$SUDO_PASS" | sudo -S fuser -k 5000/tcp 2>/dev/null || sudo -n fuser -k 5000/tcp 2>/dev/null || true
             TAG=stable $COMPOSE pull
-            TAG=stable $COMPOSE up -d
+            TAG=stable $COMPOSE up -d --remove-orphans
             echo "Waiting for /health..."
             for i in $(seq 1 15); do
               if curl --fail http://localhost:5000/health; then echo "Production health OK"; break; fi
