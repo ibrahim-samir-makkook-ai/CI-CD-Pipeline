@@ -127,7 +127,9 @@ jobs:
           script: |
             set -e
             IMAGE=$(echo "ghcr.io/${{ github.repository }}:staging" | tr '[:upper:]' '[:lower:]')
-            # Fix docker permission denied on fresh VPS (user not in docker group)
+            # Fix docker permission denied — ibrahem not in docker group, sudo needs STAGING_PASSWORD
+            SUDO_PASS="${{ secrets.STAGING_PASSWORD || secrets.STAGING_SSH_PASSWORD }}"
+            if [ -n "$SUDO_PASS" ]; then echo "$SUDO_PASS" | sudo -S -v >/dev/null 2>&1 || true; fi
             if docker ps >/dev/null 2>&1; then
               DOCKER="docker"
               COMPOSE="docker compose"
@@ -135,12 +137,12 @@ jobs:
               echo "Docker needs sudo for $USER — using sudo"
               DOCKER="sudo docker"
               COMPOSE="sudo docker compose"
-              sudo usermod -aG docker $USER 2>/dev/null || true
-              sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
+              sudo -n usermod -aG docker $USER 2>/dev/null || echo "$SUDO_PASS" | sudo -S usermod -aG docker $USER 2>/dev/null || true
+              sudo -n chmod 666 /var/run/docker.sock 2>/dev/null || echo "$SUDO_PASS" | sudo -S chmod 666 /var/run/docker.sock 2>/dev/null || true
             else
               echo "::error::Docker not accessible (even with sudo). Install docker: see SETUP_STEPS.md#1"
               docker ps 2>&1 || true
-              sudo docker ps 2>&1 || true
+              if [ -n "$SUDO_PASS" ]; then echo "$SUDO_PASS" | sudo -S docker ps 2>&1 || true; else sudo docker ps 2>&1 || true; fi
               exit 1
             fi
             echo "Using: $DOCKER ($($DOCKER --version 2>&1 | head -1)), $($COMPOSE version 2>&1 | head -1)"
@@ -305,7 +307,9 @@ jobs:
           script: |
             set -e
             IMAGE=$(echo "ghcr.io/${{ github.repository }}:stable" | tr '[:upper:]' '[:lower:]')
-            # Fix docker permission denied on fresh VPS (user not in docker group)
+            # Fix docker permission denied — sudo needs PROD_PASSWORD/STAGING_PASSWORD
+            SUDO_PASS="${{ secrets.PROD_PASSWORD || secrets.PROD_SSH_PASSWORD || secrets.STAGING_PASSWORD }}"
+            if [ -n "$SUDO_PASS" ]; then echo "$SUDO_PASS" | sudo -S -v >/dev/null 2>&1 || true; fi
             if docker ps >/dev/null 2>&1; then
               DOCKER="docker"
               COMPOSE="docker compose"
@@ -313,12 +317,12 @@ jobs:
               echo "Docker needs sudo for $USER — using sudo"
               DOCKER="sudo docker"
               COMPOSE="sudo docker compose"
-              sudo usermod -aG docker $USER 2>/dev/null || true
-              sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
+              sudo -n usermod -aG docker $USER 2>/dev/null || echo "$SUDO_PASS" | sudo -S usermod -aG docker $USER 2>/dev/null || true
+              sudo -n chmod 666 /var/run/docker.sock 2>/dev/null || echo "$SUDO_PASS" | sudo -S chmod 666 /var/run/docker.sock 2>/dev/null || true
             else
               echo "::error::Docker not accessible (even with sudo). Install docker: see SETUP_STEPS.md#1"
               docker ps 2>&1 || true
-              sudo docker ps 2>&1 || true
+              if [ -n "$SUDO_PASS" ]; then echo "$SUDO_PASS" | sudo -S docker ps 2>&1 || true; else sudo docker ps 2>&1 || true; fi
               exit 1
             fi
             echo "Using: $DOCKER ($($DOCKER --version 2>&1 | head -1)), $($COMPOSE version 2>&1 | head -1)"
