@@ -93,9 +93,55 @@ jobs:
           docker logs staging-test || true
           docker rm -f staging-test
 
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: publish-staging
+    # Skip remote deploy if no host configured — GHCR-only mode stays green
+    if: ${{ secrets.STAGING_HOST != '' }}
+    concurrency:
+      group: staging-deploy-${{ github.ref }}
+      cancel-in-progress: true
+    environment:
+      name: staging
+      url: http://${{ secrets.STAGING_HOST }}:5000
+    steps:
+      - name: Deploy to staging via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          port: ${{ secrets.STAGING_SSH_PORT || 22 }}
+          script: |
+            set -e
+            IMAGE=$(echo "ghcr.io/${{ github.repository }}:staging" | tr '[:upper:]' '[:lower:]')
+            echo "Logging into GHCR"
+            # Prefer GHCR_PAT (persistent), fallback to GITHUB_TOKEN
+            TOKEN="${{ secrets.GHCR_PAT }}"
+            if [ -z "$TOKEN" ]; then TOKEN="${{ secrets.GITHUB_TOKEN }}"; fi
+            echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            echo "Pulling $IMAGE"
+            docker pull "$IMAGE"
+            cd "${{ secrets.STAGING_PATH || '/opt/ci-cd-pipeline' }}"
+            echo "Deploying with docker compose"
+            TAG=staging docker compose pull
+            TAG=staging docker compose up -d
+            echo "Waiting for /health..."
+            for i in $(seq 1 15); do
+              if curl --fail http://localhost:5000/health; then echo "Staging health OK"; break; fi
+              echo "attempt $i/15 failed, retrying in 2s..."
+              if [ "$i" -eq 15 ]; then echo "Healthcheck failed"; docker compose logs --tail 100 || true; exit 1; fi
+              sleep 2
+            done
+            curl --fail http://localhost:5000/ | head -c 300; echo
+            echo "Staging deploy complete — digest ${{ needs.publish-staging.outputs.digest }}"
+            docker compose ps || docker ps | head -20
+
   publish-production:
     runs-on: ubuntu-latest
     needs: publish-staging
+    # To enforce staging host must be healthy before promotion, change to:
+    # needs: [publish-staging, deploy-staging]
     concurrency:
       group: production
       cancel-in-progress: true
@@ -195,3 +241,272 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Rollback with digest (immutable):" >> $GITHUB_STEP_SUMMARY
           echo "\`docker buildx imagetools create --tag ghcr.io/${{ github.repository }}:latest ghcr.io/${{ github.repository }}@sha256:<digest>\`" >> $GITHUB_STEP_SUMMARY
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: publish-production
+    # Skip remote deploy if no prod host configured — GHCR promotion still happens
+    if: ${{ secrets.PROD_HOST != '' }}
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: true
+    # Single approval gate is on publish-production. This job runs auto after approval.
+    # No `environment: production` here to avoid second approval. Use non-protected env for URL tracking if needed:
+    # environment:
+    #   name: production-deploy
+    #   url: http://${{ secrets.PROD_HOST }}:5000
+    steps:
+      - name: Deploy to production via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_SSH_PORT || 22 }}
+          script: |
+            set -e
+            IMAGE=$(echo "ghcr.io/${{ github.repository }}:stable" | tr '[:upper:]' '[:lower:]')
+            echo "Logging into GHCR"
+            TOKEN="${{ secrets.GHCR_PAT }}"
+            if [ -z "$TOKEN" ]; then TOKEN="${{ secrets.GITHUB_TOKEN }}"; fi
+            echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            echo "Pulling $IMAGE"
+            docker pull "$IMAGE"
+            cd "${{ secrets.PROD_PATH || '/opt/ci-cd-pipeline' }}"
+            echo "Deploying production with docker compose"
+            TAG=stable docker compose pull
+            TAG=stable docker compose up -d
+            echo "Waiting for /health..."
+            for i in $(seq 1 15); do
+              if curl --fail http://localhost:5000/health; then echo "Production health OK"; break; fi
+              echo "attempt $i/15 failed, retrying in 2s..."
+              if [ "$i" -eq 15 ]; then echo "Healthcheck failed"; docker compose logs --tail 100 || true; exit 1; fi
+              sleep 2
+            done
+            curl --fail http://localhost:5000/ | head -c 300; echo
+            echo "Production deploy complete"
+            docker compose ps || docker ps | head -20
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [publish-staging, deploy-staging, publish-production, deploy-production]
+    if: always()
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Resolve reviewers (GitHub logins from production environment)
+        id: reviewers
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            let logins = [];
+            try {
+              const env = await github.rest.repos.getEnvironment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                environment_name: 'production'
+              });
+              const rules = env.data.protection_rules || [];
+              for (const r of rules) {
+                for (const rev of (r.reviewers || [])) {
+                  const v = rev.reviewer;
+                  if (v?.login) logins.push(v.login);
+                  else if (v?.slug) {
+                    try {
+                      const ms = await github.rest.teams.listMembersInOrg({ org: context.repo.owner, team_slug: v.slug });
+                      ms.data.forEach(m => logins.push(m.login));
+                    } catch(e){ core.warning('team expand failed '+v.slug+': '+e.message); logins.push(v.slug); }
+                  }
+                }
+              }
+              core.info('Reviewer logins from environment: ' + logins.join(','));
+            } catch(e) {
+              core.warning('getEnvironment failed: ' + e.message);
+            }
+            // Fallback to repo owner if no reviewers configured
+            if (!logins.length) {
+              logins = [context.repo.owner];
+              core.info('No reviewers configured — fallback to owner: ' + logins.join(','));
+            }
+            // Deduplicate
+            logins = [...new Set(logins)];
+            core.setOutput('logins', logins.join(','));
+            core.setOutput('count', String(logins.length));
+            if (!logins.length) core.warning('No reviewers resolved');
+
+      - name: Build subject/body and status (GitHub Email via Issue)
+        id: msg
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+          REVIEWER_LOGINS: ${{ steps.reviewers.outputs.logins }}
+        run: |
+          NEEDS_JSON="$NEEDS_JSON" REVIEWER_LOGINS="$REVIEWER_LOGINS" python3 - << 'PY'
+          import json, os, pathlib
+          needs = json.loads(os.environ.get("NEEDS_JSON","{}"))
+          logins = os.environ.get("REVIEWER_LOGINS","")
+          repo = "${{ github.repository }}"
+          sha = "${{ github.sha }}"[:7]
+          full_sha = "${{ github.sha }}"
+          actor = "${{ github.actor }}"
+          ref = "${{ github.ref }}"
+          run_id = "${{ github.run_id }}"
+          run_url = f"https://github.com/{repo}/actions/runs/{run_id}"
+          failed = [k for k,v in needs.items() if v.get("result")=="failure"]
+          cancelled = [k for k,v in needs.items() if v.get("result")=="cancelled"]
+          skipped = [k for k,v in needs.items() if v.get("result")=="skipped"]
+          causes = []
+          if "publish-staging" in failed:
+              causes.append("• publish-staging failed: Docker build/push or local smoke test (docker run + curl /health on runner, cd.yml:68) — check build logs, Dockerfile, GHCR login")
+          if "deploy-staging" in failed:
+              causes.append("• deploy-staging failed: SSH to STAGING_HOST or TAG=staging docker compose pull/up or healthcheck (curl http://localhost:5000/health) — check host, docker compose, GHCR_PAT, firewall")
+          if "publish-production" in failed:
+              causes.append("• publish-production failed: stale promotion guard (cd.yml:183) blocked old digest, or imagetools create --tag :latest/:stable failed — approve latest run, check GHCR auth")
+          if "deploy-production" in failed:
+              causes.append("• deploy-production failed: SSH to PROD_HOST or TAG=stable healthcheck — check prod host, GHCR_PAT, compose file")
+          if cancelled:
+              causes.append(f"• Cancelled (stale): {', '.join(cancelled)} — newer push to main cancelled waiting production run (concurrency: production/cancel:true). Not a bug; approve latest run.")
+          if not failed and not cancelled:
+              causes.append("All jobs succeeded or skipped (GHCR-only mode where *_HOST empty is expected).")
+          digest = needs.get("publish-staging", {}).get("outputs", {}).get("digest", "n/a")
+          if failed:
+              subject = f"[CD] ❌ Failure {sha} ({ref}) by {actor} — {','.join(failed)}"
+          elif cancelled and not failed:
+              subject = f"[CD] ⚠️ Cancelled (stale) {sha} by {actor}"
+          else:
+              subject = f"[CD] ✅ Success {sha} ({ref}) by {actor} — production deployed"
+          body_lines = []
+          body_lines.append(f"Repository: {repo}")
+          body_lines.append(f"Branch/Ref: {ref}")
+          body_lines.append(f"Commit: {full_sha} ({sha}) by {actor}")
+          body_lines.append(f"Run: {run_url}")
+          body_lines.append(f"Reviewers (GitHub): {logins or 'n/a'}")
+          body_lines.append(f"CC: {', '.join(['@'+l for l in logins.split(',') if l]) if logins else 'n/a'}")
+          body_lines.append(f"Results: {json.dumps({k: v.get('result') for k,v in needs.items()}, indent=2)}")
+          body_lines.append("")
+          if failed:
+              body_lines.append("Status: ❌ FAILURE — Email notification via GitHub Issue (assignees receive GitHub email)")
+              body_lines.append(f"Failed jobs: {', '.join(failed)}")
+              if cancelled: body_lines.append(f"Cancelled: {', '.join(cancelled)}")
+              if skipped: body_lines.append(f"Skipped (expected if GHCR-only): {', '.join(skipped)}")
+              body_lines.append("")
+              body_lines.append("Issues & Causes:")
+              body_lines.extend(causes)
+              body_lines.append("")
+              body_lines.append(f"Digest (staging): {digest}")
+              body_lines.append("Action: Fix cause, push to main, or if stale guard triggered approve latest run.")
+          elif cancelled:
+              body_lines.append("Status: ⚠️ CANCELLED (stale)")
+              body_lines.extend(causes)
+              body_lines.append(f"Digest: {digest}")
+          else:
+              body_lines.append("Status: ✅ SUCCESS — staging auto-deployed, production promoted & deployed after approval")
+              if skipped: body_lines.append(f"Skipped (GHCR-only expected): {', '.join(skipped)}")
+              body_lines.append(f"Digest: {digest}")
+              body_lines.append("Images: ghcr.io/...:staging → :latest/:stable (same digest via imagetools, no rebuild)")
+              body_lines.append("Staging: http://${{ secrets.STAGING_HOST }}:5000 health OK (if STAGING_HOST set)")
+              body_lines.append("Production: https://ghcr.io/${{ github.repository }}:latest → http://${{ secrets.PROD_HOST }}:5000 health OK")
+              body_lines.append(f"Rollback: docker buildx imagetools create --tag ghcr.io/{repo}:latest ghcr.io/{repo}@<digest>")
+              body_lines.append("Acknowledgement: Production reviewers notified via GitHub Issue (email) of successful promotion and deployment.")
+          body_lines.append("")
+          body_lines.append("---")
+          body_lines.append("This issue was auto-created by `notify` job to trigger GitHub Email notifications to assignees/mentioned reviewers. GitHub sends email to their registered address if they have `Watch` and `Email` notifications enabled.")
+          body = "\n".join(body_lines)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write(f"is_failure={'true' if failed else 'false'}\n")
+              f.write(f"is_cancelled={'true' if cancelled and not failed else 'false'}\n")
+              f.write(f"is_success={'true' if not failed and not cancelled else 'false'}\n")
+              f.write(f"subject={subject}\n")
+              f.write(f"body<<__BODY__\n{body}\n__BODY__\n")
+          PY
+
+      - name: Create GitHub Issue — Failure (triggers Email to reviewers)
+        if: steps.msg.outputs.is_failure == 'true'
+        uses: actions/github-script@v7
+        env:
+          SUBJECT: ${{ steps.msg.outputs.subject }}
+          BODY: ${{ steps.msg.outputs.body }}
+          LOGINS: ${{ steps.reviewers.outputs.logins }}
+        with:
+          script: |
+            const logins = (process.env.LOGINS || '').split(',').map(s=>s.trim()).filter(Boolean).slice(0,10);
+            const title = process.env.SUBJECT;
+            let body = process.env.BODY;
+            if (logins.length) body += `\n\nCC: ${logins.map(l => '@' + l).join(' ')}`;
+            const labels = ['cd-failure','notify'];
+            // Ensure labels exist (ignore error if not)
+            try {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title, body,
+                assignees: logins,
+                labels
+              });
+              core.info('Created failure issue assigned to ' + logins.join(','));
+            } catch(e) {
+              // Fallback without labels if labels missing
+              core.warning('create with labels failed: ' + e.message + ' — retry without labels');
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title, body,
+                assignees: logins
+              });
+            }
+
+      - name: Create GitHub Issue — Success Ack (triggers Email to reviewers)
+        if: steps.msg.outputs.is_success == 'true'
+        uses: actions/github-script@v7
+        env:
+          SUBJECT: ${{ steps.msg.outputs.subject }}
+          BODY: ${{ steps.msg.outputs.body }}
+          LOGINS: ${{ steps.reviewers.outputs.logins }}
+        with:
+          script: |
+            const logins = (process.env.LOGINS || '').split(',').map(s=>s.trim()).filter(Boolean).slice(0,10);
+            const title = process.env.SUBJECT;
+            let body = process.env.BODY;
+            if (logins.length) body += `\n\nCC: ${logins.map(l => '@' + l).join(' ')}`;
+            const labels = ['cd-success','notify'];
+            try {
+              const { data } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title, body,
+                assignees: logins,
+                labels
+              });
+              core.info('Created success issue #' + data.number);
+              // Auto-close success ack to avoid issue spam, but email already sent
+              try {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: data.number,
+                  state: 'closed'
+                });
+                core.info('Closed success issue (ack) — email already delivered');
+              } catch(e){ core.warning('close failed: '+e.message); }
+            } catch(e) {
+              core.warning('create with labels failed: ' + e.message);
+              const { data } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title, body,
+                assignees: logins
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: data.number,
+                state: 'closed'
+              });
+            }
+
+      - name: Log cancelled — no email
+        if: steps.msg.outputs.is_cancelled == 'true'
+        run: |
+          echo "::notice::CD cancelled (stale) — no failure/success email"
+          echo "${{ steps.msg.outputs.body }}"
