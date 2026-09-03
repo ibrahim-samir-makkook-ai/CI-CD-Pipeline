@@ -9,6 +9,8 @@ services:
     ports:
       - "5000:5000"
     container_name: ci-cd-pipeline-test
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-${TAG:-staging}}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]

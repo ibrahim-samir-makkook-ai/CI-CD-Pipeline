@@ -1,3 +1,5 @@
+import os
+
 from flask import Flask, Response, jsonify
 
 app: Flask = Flask(__name__)
@@ -10,7 +12,14 @@ def add(a: int, b: int) -> int:
 
 @app.route("/")
 def home() -> tuple[Response, int]:
-    return jsonify(message="Hello, CI/CD Pipeline! test"), 200
+    env = os.getenv("ENVIRONMENT", os.getenv("TAG", "")).lower()
+    if env in ("staging", "stage"):
+        msg = "hello from staging"
+    elif env in ("production", "prod", "stable", "latest"):
+        msg = "hello from production"
+    else:
+        msg = "Hello, CI/CD Pipeline! test"
+    return jsonify(message=msg), 200
 
 
 @app.route("/health")

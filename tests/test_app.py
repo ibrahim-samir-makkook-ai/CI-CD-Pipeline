@@ -14,10 +14,32 @@ def test_home_status_code(client):
     assert response.status_code == 200
 
 
-def test_home_message(client):
+def test_home_message(client, monkeypatch):
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    monkeypatch.delenv("TAG", raising=False)
+    # reimport to pick up cleared env (app reads env at request time, so just clear)
     response = client.get("/")
     data = response.get_json()
     assert data["message"] == "Hello, CI/CD Pipeline! test"
+
+
+def test_home_staging(client, monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    response = client.get("/")
+    assert response.get_json()["message"] == "hello from staging"
+
+
+def test_home_production(client, monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    response = client.get("/")
+    assert response.get_json()["message"] == "hello from production"
+
+
+def test_home_production_via_tag(client, monkeypatch):
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    monkeypatch.setenv("TAG", "stable")
+    response = client.get("/")
+    assert response.get_json()["message"] == "hello from production"
 
 
 def test_health(client):
