@@ -128,18 +128,14 @@ jobs:
       # url must not use secrets (GH Actions forbids secrets in environment.url) — use static GHCR url
       url: https://ghcr.io/${{ github.repository }}:staging
     steps:
-      - name: Check STAGING_HOST configured (GHCR-only skip)
-        id: check
+      - name: Check STAGING_HOST configured
         run: |
           if [ -z "${{ secrets.STAGING_HOST }}" ]; then
-            echo "configured=false" >> $GITHUB_OUTPUT
-            echo "::notice::STAGING_HOST not set — GHCR-only mode, skipping SSH deploy"
-          else
-            echo "configured=true" >> $GITHUB_OUTPUT
+            echo "::error::STAGING_HOST not set — deployment requires STAGING_HOST secret"
+            exit 1
           fi
 
       - name: Deploy to staging via SSH
-        if: steps.check.outputs.configured == 'true'
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.STAGING_HOST }}
@@ -336,18 +332,14 @@ jobs:
       name: production
       url: https://ghcr.io/${{ github.repository }}:latest
     steps:
-      - name: Check PROD_HOST configured (GHCR-only skip)
-        id: check
+      - name: Check PROD_HOST configured
         run: |
           if [ -z "${{ secrets.PROD_HOST }}" ]; then
-            echo "configured=false" >> $GITHUB_OUTPUT
-            echo "::notice::PROD_HOST not set — GHCR promotion only, skipping SSH deploy"
-          else
-            echo "configured=true" >> $GITHUB_OUTPUT
+            echo "::error::PROD_HOST not set — deployment requires PROD_HOST secret"
+            exit 1
           fi
 
       - name: Deploy to production via SSH
-        if: steps.check.outputs.configured == 'true'
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.PROD_HOST }}
@@ -524,7 +516,7 @@ jobs:
             digest_line=f"\n**Digest:** `{digest}` — immutable promotion via `imagetools create` (no rebuild)\n"
           else:
             digest_line=""
-          subject=f"[Pre-Production] {'❌ Failure' if is_failure else ('⚠️ Cancelled' if is_cancelled else '✅ Ready for Approval')} {sha} by {actor}"
+          subject="staging deployment"
           if is_cancelled:
               body=f"### ⚠️ Pre-Production Cancelled — `{sha}` by @{actor}\n"
               body+=f"\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n{digest_line}\n\n_No email for cancelled (stale) runs._\n"
@@ -546,11 +538,12 @@ jobs:
           SUBJECT: ${{ steps.msg.outputs.subject }}
           BODY: ${{ steps.msg.outputs.body }}
           LOGINS: ${{ steps.reviewers.outputs.logins }}
+          IS_FAILURE: ${{ steps.msg.outputs.is_failure }}
         with:
           script: |
             const logins=(process.env.LOGINS||'').split(',').filter(Boolean).slice(0,10);
             let body=process.env.BODY;
-            const isFailure = process.env.SUBJECT.includes('❌');
+            const isFailure = process.env.IS_FAILURE === 'true';
             const labels = isFailure ? ['preprod-failure','notify'] : ['preprod-success','notify'];
             try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels}); core.info('Created preproduction issue — Email 1 sent'); }catch(e){ core.warning(e.message); await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
 
@@ -618,16 +611,16 @@ jobs:
           def icon(s): return "✅" if s=="success" else "❌" if s=="failure" else "⏭️" if s=="skipped" else "⚠️" if s=="cancelled" else "⚠️"
           table=f"| Production deploy | {icon(deploy_result)} {deploy_result} |"
           if is_skipped:
-            subject=f"[Production] ⏭️ Skipped {sha} by {actor}"
-            body=f"### ⏭️ Production Skipped — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n_Production deployment was skipped (upstream failure or GHCR-only mode without PROD_HOST)._ \n"
+            subject="production deployment"
+            body=f"### ⏭️ Production Skipped — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n_Production deployment was skipped (upstream failure)._ \n"
           elif is_cancelled:
-            subject=f"[Production] ⚠️ Cancelled {sha} by {actor}"
+            subject="production deployment"
             body=f"### ⚠️ Production Cancelled — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n"
           elif is_failure:
-            subject=f"[Production] ❌ Failure {sha} by {actor}"
+            subject="production deployment"
             body=f"### ❌ Production Deployment Failed — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n_Production deployment failed after approval — check deploy logs and consider rollback via immutable digest._\n"
           else:
-            subject=f"[Production] ✅ Success {sha} by {actor}"
+            subject="production deployment"
             body=f"### ✅ Production Deployed — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n🚀 Production is live.\n"
           open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if is_failure else 'false'}\nis_cancelled={'true' if is_cancelled else 'false'}\nis_skipped={'true' if is_skipped else 'false'}\nis_success={'true' if is_success else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
           PY
@@ -639,11 +632,12 @@ jobs:
           SUBJECT: ${{ steps.msg.outputs.subject }}
           BODY: ${{ steps.msg.outputs.body }}
           LOGINS: ${{ steps.reviewers.outputs.logins }}
+          IS_FAILURE: ${{ steps.msg.outputs.is_failure }}
         with:
           script: |
             const logins=(process.env.LOGINS||'').split(',').filter(Boolean).slice(0,10);
             let body=process.env.BODY;
-            const isFailure = process.env.SUBJECT.includes('❌');
+            const isFailure = process.env.IS_FAILURE === 'true';
             const labels = isFailure ? ['prod-failure','notify'] : ['prod-success','notify'];
             try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels}); core.info('Created prod issue — Email 2 sent'); }catch(e){ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
 
