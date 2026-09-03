@@ -172,35 +172,39 @@ jobs:
             echo "$TOKEN" | $DOCKER login ghcr.io -u "${{ github.actor }}" --password-stdin
             echo "Pulling $IMAGE"
             $DOCKER pull "$IMAGE"
+            # Port from secrets or variables (generic, same-server needs different ports)
+            STAGING_PORT="${{ secrets.STAGING_PORT || vars.STAGING_PORT || 5000 }}"
             STAGING_PATH="${{ secrets.STAGING_PATH || '/opt/ci-cd-pipeline' }}"
             [ -z "$STAGING_PATH" ] && STAGING_PATH="/opt/ci-cd-pipeline"
+            [ -z "$STAGING_PORT" ] && STAGING_PORT="5000"
+            echo "Staging config: STAGING_PORT=$STAGING_PORT STAGING_PATH=$STAGING_PATH"
             mkdir -p "$STAGING_PATH" 2>/dev/null || ( [ -n "$SUDO_PASS" ] && echo "$SUDO_PASS" | sudo -S mkdir -p "$STAGING_PATH" && echo "$SUDO_PASS" | sudo -S chown $USER:$USER "$STAGING_PATH" )
             cd "$STAGING_PATH"
             echo "Staging path: $(pwd) (STAGING_PATH=$STAGING_PATH) contents:"
             ls -la | head -30 || true
             if [ ! -f docker-compose.yml ] && [ ! -f compose.yml ] && [ ! -f compose.yaml ]; then
-              echo "docker-compose.yml missing in $STAGING_PATH — creating template"
-              printf '%s\n' 'services:' '  app:' '    image: ghcr.io/ibrahim-samir-makkook-ai/ci-cd-pipeline:${TAG:-staging}' '    ports: ["5000:5000"]' '    container_name: ci-cd-pipeline-test' '    restart: unless-stopped' '    healthcheck:' '      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('\''http://localhost:5000/health'\'')"]' '      interval: 10s' '      timeout: 3s' '      retries: 3' '      start_period: 5s' > docker-compose.yml
+              echo "docker-compose.yml missing in $STAGING_PATH — creating template (port $STAGING_PORT for generic same-server)"
+              printf '%s\n' 'services:' '  app:' '    image: ghcr.io/ibrahim-samir-makkook-ai/ci-cd-pipeline:${TAG:-staging}' "    ports: [\"$STAGING_PORT:5000\"]" '    container_name: ci-cd-pipeline-test' '    restart: unless-stopped' '    healthcheck:' '      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('\''http://localhost:5000/health'\'')"]' '      interval: 10s' '      timeout: 3s' '      retries: 3' '      start_period: 5s' > docker-compose.yml
               echo "Created docker-compose.yml:"
               cat docker-compose.yml
             fi
             $COMPOSE config >/dev/null && echo "compose valid" || (echo "::error::compose invalid"; cat docker-compose.yml || true; exit 1)
-            echo "Deploying with docker compose (cleaning stale port 5000)"
-            # Clean previous compose project and orphan ci-cd-pipeline-test (fixes Bind 0.0.0.0:5000 failed: port is already allocated)
+            echo "Deploying with docker compose (cleaning stale port $STAGING_PORT)"
+            # Clean previous compose project and orphan ci-cd-pipeline-test (fixes Bind 0.0.0.0:$STAGING_PORT failed: port is already allocated)
             TAG=staging $COMPOSE down 2>/dev/null || true
             $DOCKER rm -f ci-cd-pipeline-test 2>/dev/null || echo "$SUDO_PASS" | sudo -S docker rm -f ci-cd-pipeline-test 2>/dev/null || true
-            $DOCKER ps -q --filter publish=5000 | xargs -r $DOCKER rm -f 2>/dev/null || $DOCKER ps -q --filter publish=5000 | xargs -r echo "$SUDO_PASS" | sudo -S docker rm -f 2>/dev/null || true
-            echo "$SUDO_PASS" | sudo -S fuser -k 5000/tcp 2>/dev/null || sudo -n fuser -k 5000/tcp 2>/dev/null || true
+            $DOCKER ps -q --filter publish=$STAGING_PORT | xargs -r $DOCKER rm -f 2>/dev/null || $DOCKER ps -q --filter publish=$STAGING_PORT | xargs -r echo "$SUDO_PASS" | sudo -S docker rm -f 2>/dev/null || true
+            echo "$SUDO_PASS" | sudo -S fuser -k $STAGING_PORT/tcp 2>/dev/null || sudo -n fuser -k $STAGING_PORT/tcp 2>/dev/null || true
             TAG=staging $COMPOSE pull
             TAG=staging $COMPOSE up -d --remove-orphans
-            echo "Waiting for /health..."
+            echo "Waiting for /health on $STAGING_PORT..."
             for i in $(seq 1 15); do
-              if curl --fail http://localhost:5000/health; then echo "Staging health OK"; break; fi
+              if curl --fail http://localhost:$STAGING_PORT/health; then echo "Staging health OK"; break; fi
               echo "attempt $i/15 failed, retrying in 2s..."
               if [ "$i" -eq 15 ]; then echo "Healthcheck failed"; $COMPOSE logs --tail 100 || $DOCKER ps -a | head -20; exit 1; fi
               sleep 2
             done
-            curl --fail http://localhost:5000/ | head -c 300; echo
+            curl --fail http://localhost:$STAGING_PORT/ | head -c 300; echo
             echo "Staging deploy complete — digest ${{ needs.publish-staging.outputs.digest }}"
             $COMPOSE ps || $DOCKER ps | head -20
 
@@ -375,35 +379,40 @@ jobs:
             echo "$TOKEN" | $DOCKER login ghcr.io -u "${{ github.actor }}" --password-stdin
             echo "Pulling $IMAGE"
             $DOCKER pull "$IMAGE"
-            PROD_PATH="${{ secrets.PROD_PATH || '/opt/ci-cd-pipeline' }}"
-            [ -z "$PROD_PATH" ] && PROD_PATH="/opt/ci-cd-pipeline"
+            # Port from secrets or variables (generic, same-server needs different ports; prod defaults to 5001)
+            PROD_PORT="${{ secrets.PROD_PORT || vars.PROD_PORT || 5001 }}"
+            PROD_PATH="${{ secrets.PROD_PATH || '/opt/ci-cd-pipeline-prod' }}"
+            [ -z "$PROD_PATH" ] && PROD_PATH="/opt/ci-cd-pipeline-prod"
+            [ -z "$PROD_PORT" ] && PROD_PORT="5001"
+            echo "Prod config: PROD_PORT=$PROD_PORT PROD_PATH=$PROD_PATH"
             mkdir -p "$PROD_PATH" 2>/dev/null || ( [ -n "$SUDO_PASS" ] && echo "$SUDO_PASS" | sudo -S mkdir -p "$PROD_PATH" && echo "$SUDO_PASS" | sudo -S chown $USER:$USER "$PROD_PATH" )
             cd "$PROD_PATH"
             echo "Prod path: $(pwd) (PROD_PATH=$PROD_PATH) contents:"
             ls -la | head -30 || true
             if [ ! -f docker-compose.yml ] && [ ! -f compose.yml ] && [ ! -f compose.yaml ]; then
-              echo "docker-compose.yml missing in $PROD_PATH — creating template"
-              printf '%s\n' 'services:' '  app:' '    image: ghcr.io/ibrahim-samir-makkook-ai/ci-cd-pipeline:${TAG:-stable}' '    ports: ["5000:5000"]' '    container_name: ci-cd-pipeline-test' '    restart: unless-stopped' '    healthcheck:' '      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('\''http://localhost:5000/health'\'')"]' '      interval: 10s' '      timeout: 3s' '      retries: 3' '      start_period: 5s' > docker-compose.yml
+              echo "docker-compose.yml missing in $PROD_PATH — creating template (prod on $PROD_PORT for same-server)"
+              printf '%s\n' 'services:' '  app:' '    image: ghcr.io/ibrahim-samir-makkook-ai/ci-cd-pipeline:${TAG:-stable}' "    ports: [\"$PROD_PORT:5000\"]" '    container_name: ci-cd-pipeline-prod' '    restart: unless-stopped' '    healthcheck:' '      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('\''http://localhost:5000/health'\'')"]' '      interval: 10s' '      timeout: 3s' '      retries: 3' '      start_period: 5s' > docker-compose.yml
               echo "Created docker-compose.yml:"
               cat docker-compose.yml
             fi
             $COMPOSE config >/dev/null && echo "compose valid" || (echo "::error::compose invalid"; cat docker-compose.yml || true; exit 1)
-            echo "Deploying production with docker compose (cleaning stale port 5000)"
+            echo "Deploying production with docker compose (cleaning stale port $PROD_PORT)"
             TAG=stable $COMPOSE down 2>/dev/null || true
+            $DOCKER rm -f ci-cd-pipeline-prod 2>/dev/null || echo "$SUDO_PASS" | sudo -S docker rm -f ci-cd-pipeline-prod 2>/dev/null || true
             $DOCKER rm -f ci-cd-pipeline-test 2>/dev/null || echo "$SUDO_PASS" | sudo -S docker rm -f ci-cd-pipeline-test 2>/dev/null || true
-            $DOCKER ps -q --filter publish=5000 | xargs -r $DOCKER rm -f 2>/dev/null || $DOCKER ps -q --filter publish=5000 | xargs -r echo "$SUDO_PASS" | sudo -S docker rm -f 2>/dev/null || true
-            echo "$SUDO_PASS" | sudo -S fuser -k 5000/tcp 2>/dev/null || sudo -n fuser -k 5000/tcp 2>/dev/null || true
+            $DOCKER ps -q --filter publish=$PROD_PORT | xargs -r $DOCKER rm -f 2>/dev/null || $DOCKER ps -q --filter publish=$PROD_PORT | xargs -r echo "$SUDO_PASS" | sudo -S docker rm -f 2>/dev/null || true
+            echo "$SUDO_PASS" | sudo -S fuser -k $PROD_PORT/tcp 2>/dev/null || sudo -n fuser -k $PROD_PORT/tcp 2>/dev/null || true
             TAG=stable $COMPOSE pull
             TAG=stable $COMPOSE up -d --remove-orphans
-            echo "Waiting for /health..."
+            echo "Waiting for /health on $PROD_PORT..."
             for i in $(seq 1 15); do
-              if curl --fail http://localhost:5000/health; then echo "Production health OK"; break; fi
+              if curl --fail http://localhost:$PROD_PORT/health; then echo "Production health OK"; break; fi
               echo "attempt $i/15 failed, retrying in 2s..."
               if [ "$i" -eq 15 ]; then echo "Healthcheck failed"; $COMPOSE logs --tail 100 || $DOCKER ps -a | head -20; exit 1; fi
               sleep 2
             done
-            curl --fail http://localhost:5000/ | head -c 300; echo
-            echo "Production deploy complete"
+            curl --fail http://localhost:$PROD_PORT/ | head -c 300; echo
+            echo "Production deploy complete on $PROD_PORT"
             $COMPOSE ps || $DOCKER ps | head -20
 
   notify-preproduction:
