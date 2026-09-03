@@ -1,5 +1,28 @@
 name: CD Pipeline
 
+# ============================================================================
+# CD Pipeline — Optimized Flow with 2-Stage Notifications & Deferred Approval
+# ============================================================================
+# Flow:
+#   1. publish-staging    : Build & push :staging + local smoke test (no approval, staging env)
+#   2. deploy-staging     : SSH deploy to staging (staging env)
+#   3. publish-production : Promote already-tested staging digest to :latest/:stable
+#                           via immutable `docker buildx imagetools create` (NO rebuild, NO approval)
+#                           — keeps digest promotion, runs automatically after staging validated.
+#   4. notify-preproduction (Email 1): CI + staging + production image published
+#                           + "Production deployment is waiting for approval"
+#                           Depends on: publish-staging, deploy-staging, publish-production
+#   5. deploy-production  : SSH deploy to production (protected `production` environment)
+#                           -> Approval happens HERE before actual production deployment.
+#                           Concurrency `production` auto-cancels stale waiting runs on new push.
+#   6. notify-production (Email 2): Production deployment result (success/failure) after approval
+#                           Depends only on: deploy-production
+#
+# Exactly 2 custom notification emails (via GitHub Issue -> email). No duplicates.
+# Generic, clean, scalable: uses github.repository + secrets, no hard-coded env values.
+# Immutable digest promotion retained (no rebuild of production image).
+# ============================================================================
+
 on:
   push:
     branches: ["main"]
@@ -186,20 +209,20 @@ jobs:
             $COMPOSE ps || $DOCKER ps | head -20
 
   publish-production:
+    # --------------------------------------------------------------
+    # Production image publish — NO approval required here.
+    # Promotes the already-tested staging digest to production tags
+    # (latest/stable) via immutable digest promotion (no rebuild).
+    # Runs automatically after staging is validated (publish-staging + deploy-staging).
+    # Approval is deferred to deploy-production (protected `production` env).
+    # Concurrency `production` ensures stale runs auto-cancel on new push,
+    # keeping digest promotion consistent with the latest commit.
+    # --------------------------------------------------------------
     runs-on: ubuntu-latest
-    needs: publish-staging
-    # To enforce staging host must be healthy before promotion, change to:
-    # needs: [publish-staging, deploy-staging]
+    needs: [publish-staging, deploy-staging]
     concurrency:
       group: production
       cancel-in-progress: true
-    # Manual approval gate: configure in GitHub UI
-    # Settings > Environments > production > Required reviewers: add 1+ reviewer
-    # This job will pause with "Waiting for approval" until reviewer approves
-    # stale Waiting runs are auto-canceled on new push (concurrency: production, cancel: true)
-    environment:
-      name: production
-      url: https://ghcr.io/${{ github.repository }}:latest
     permissions:
       contents: read
       packages: write
@@ -279,7 +302,7 @@ jobs:
             echo "Creating tag: $TAG -> $SRC"
             docker buildx imagetools create --tag "$TAG" "$SRC"
           done
-          echo "Production promotion complete (manual approval was required)"
+          echo "Production image published (no approval required here) — promotion complete via immutable digest"
           docker buildx imagetools inspect "${IMAGE}:latest" || true
           docker buildx imagetools inspect "${IMAGE}:stable" || true
 
@@ -290,20 +313,28 @@ jobs:
           echo "Tags: \`${{ steps.meta.outputs.tags }}\`" | tr ',' '\n' >> $GITHUB_STEP_SUMMARY
           echo "Source digest: \`${{ needs.publish-staging.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Next: awaiting manual approval for production deployment (deploy-production)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "Rollback with digest (immutable):" >> $GITHUB_STEP_SUMMARY
           echo "\`docker buildx imagetools create --tag ghcr.io/${{ github.repository }}:latest ghcr.io/${{ github.repository }}@sha256:<digest>\`" >> $GITHUB_STEP_SUMMARY
 
   deploy-production:
+    # --------------------------------------------------------------
+    # Production deployment — REQUIRES manual approval via protected
+    # `production` environment. Reviewer configured in:
+    #   Settings > Environments > production > Required reviewers
+    # This job waits for approval before any SSH deploy happens.
+    # Concurrency `production` ensures stale waiting runs auto-cancel
+    # on new push (cancel-in-progress: true).
+    # --------------------------------------------------------------
     runs-on: ubuntu-latest
     needs: publish-production
     concurrency:
-      group: production-deploy
+      group: production
       cancel-in-progress: true
-    # Single approval gate is on publish-production. This job runs auto after approval.
-    # No `environment: production` here to avoid second approval. Use non-protected env for URL tracking if needed:
-    # environment:
-    #   name: production-deploy
-    #   url: http://prod.example.com:5000  # static — do not use secrets here
+    environment:
+      name: production
+      url: https://ghcr.io/${{ github.repository }}:latest
     steps:
       - name: Check PROD_HOST configured (GHCR-only skip)
         id: check
@@ -383,9 +414,17 @@ jobs:
             echo "Production deploy complete"
             $COMPOSE ps || $DOCKER ps | head -20
 
-  notify-staging:
+  notify-preproduction:
+    # --------------------------------------------------------------
+    # Email 1 — Pre-Production Summary (exactly 1 of 2 custom emails)
+    # Triggers AFTER: CI + staging build/deploy + production image published.
+    # Indicates that production deployment is WAITING for manual approval.
+    # Depends on: publish-staging, deploy-staging, publish-production
+    # Runs with `if: always()` to report success OR failure; suppresses
+    # duplicate emails by replacing the old notify-staging job.
+    # --------------------------------------------------------------
     runs-on: ubuntu-latest
-    needs: [publish-staging, deploy-staging]
+    needs: [publish-staging, deploy-staging, publish-production]
     if: always()
     permissions:
       contents: read
@@ -412,7 +451,7 @@ jobs:
             logins = [...new Set(logins)];
             core.setOutput('logins', logins.join(','));
 
-      - name: Fetch CI status (for combined CI+CD staging email)
+      - name: Fetch CI status (for combined CI+CD preproduction email)
         id: ci
         uses: actions/github-script@v7
         with:
@@ -452,7 +491,7 @@ jobs:
             core.setOutput('found', String(found));
             core.info(`CI: ${JSON.stringify(ci)} found=${found}`);
 
-      - name: Build minimal staging message
+      - name: Build preproduction message (CI + staging + prod publish + awaiting approval)
         id: msg
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
@@ -460,11 +499,13 @@ jobs:
           CI_LINT: ${{ steps.ci.outputs.lint }}
           CI_TEST: ${{ steps.ci.outputs.test }}
           CI_DOCKER: ${{ steps.ci.outputs.docker }}
+          DIGEST: ${{ needs.publish-staging.outputs.digest }}
         run: |
-          NEEDS_JSON="$NEEDS_JSON" LOGINS="$LOGINS" CI_LINT="$CI_LINT" CI_TEST="$CI_TEST" CI_DOCKER="$CI_DOCKER" python3 - << 'PY'
+          NEEDS_JSON="$NEEDS_JSON" LOGINS="$LOGINS" CI_LINT="$CI_LINT" CI_TEST="$CI_TEST" CI_DOCKER="$CI_DOCKER" DIGEST="$DIGEST" python3 - << 'PY'
           import json, os
           needs=json.loads(os.environ["NEEDS_JSON"])
           ci = {"lint": os.environ["CI_LINT"], "test": os.environ["CI_TEST"], "docker": os.environ["CI_DOCKER"]}
+          digest = os.environ.get("DIGEST","")
           repo="${{ github.repository }}"; sha="${{ github.sha }}"[:7]; actor="${{ github.actor }}"
           run_url=f"https://github.com/{repo}/actions/runs/${{ github.run_id }}"
           def norm(v): return "success" if v=="success" else "failure" if v=="failure" else "cancelled" if v=="cancelled" else "skipped" if v in ["skipped","cancelled"] else v
@@ -478,22 +519,30 @@ jobs:
           is_cancelled=len(cancelled)>0 and not is_failure
           is_success=not is_failure and not is_cancelled
           def icon(s): return "✅" if s=="success" else "❌" if s=="failure" else "⏭️" if s=="skipped" else "⚠️" if s=="cancelled" else "⚠️"
-          table=f"| CI lint | {icon(ci['lint'])} {ci['lint']} |\n| CI test | {icon(ci['test'])} {ci['test']} |\n| CI docker | {icon(ci['docker'])} {ci['docker']} |\n| Staging build | {icon(cd.get('publish-staging','skipped'))} {cd.get('publish-staging','skipped')} |\n| Staging deploy | {icon(cd.get('deploy-staging','skipped'))} {cd.get('deploy-staging','skipped')} |"
-          mermaid="```mermaid\nflowchart LR\n  lint-->test-->docker-->staging_build-->staging_deploy\n"
-          mermaid+=f"  lint[{icon(ci['lint'])} lint]\n  test[{icon(ci['test'])} test]\n  docker[{icon(ci['docker'])} docker]\n  staging_build[{icon(cd.get('publish-staging','skipped'))} build]\n  staging_deploy[{icon(cd.get('deploy-staging','skipped'))} deploy]\n"
-          mermaid+="  classDef fail fill:#ffcccc,stroke:#cc0000\n```"
-          subject=f"[Staging] {'❌ Failure' if is_failure else ('⚠️ Cancelled' if is_cancelled else '✅ Success')} {sha} by {actor}"
-          if is_cancelled:
-              body=f"### ⚠️ Staging Cancelled — `{sha}` by @{actor}\n"
-          elif is_failure:
-              body=f"### ❌ Staging Failed — `{sha}` by @{actor}\n"
+          table=f"| CI lint | {icon(ci['lint'])} {ci['lint']} |\n| CI test | {icon(ci['test'])} {ci['test']} |\n| CI docker | {icon(ci['docker'])} {ci['docker']} |\n| Staging build | {icon(cd.get('publish-staging','skipped'))} {cd.get('publish-staging','skipped')} |\n| Staging deploy | {icon(cd.get('deploy-staging','skipped'))} {cd.get('deploy-staging','skipped')} |\n| Production image (publish) | {icon(cd.get('publish-production','skipped'))} {cd.get('publish-production','skipped')} |"
+          mermaid="```mermaid\nflowchart LR\n  lint-->test-->docker-->staging_build-->staging_deploy-->prod_publish\n"
+          mermaid+=f"  lint[{icon(ci['lint'])} lint]\n  test[{icon(ci['test'])} test]\n  docker[{icon(ci['docker'])} docker]\n  staging_build[{icon(cd.get('publish-staging','skipped'))} build]\n  staging_deploy[{icon(cd.get('deploy-staging','skipped'))} deploy]\n  prod_publish[{icon(cd.get('publish-production','skipped'))} publish]\n"
+          mermaid+="```"
+          if digest:
+            digest_line=f"\n**Digest:** `{digest}` — immutable promotion via `imagetools create` (no rebuild)\n"
           else:
-              body=f"### ✅ Staging Passed — `{sha}` by @{actor}\n"
-          body+=f"\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
+            digest_line=""
+          subject=f"[Pre-Production] {'❌ Failure' if is_failure else ('⚠️ Cancelled' if is_cancelled else '✅ Ready for Approval')} {sha} by {actor}"
+          if is_cancelled:
+              body=f"### ⚠️ Pre-Production Cancelled — `{sha}` by @{actor}\n"
+              body+=f"\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n{digest_line}\n{mermaid}\n\n_No email for cancelled (stale) runs._\n"
+          elif is_failure:
+              body=f"### ❌ Pre-Production Failed — `{sha}` by @{actor}\n"
+              body+=f"\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n{digest_line}\n{mermaid}\n\n**Failed stages:** `{', '.join(failed)}` — fix and push again. Production deployment **not** awaiting approval.\n"
+          else:
+              body=f"### ✅ Pre-Production Passed — `{sha}` by @{actor}\n"
+              body+=f"\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n{digest_line}\n{mermaid}\n\n🚦 **Production deployment is waiting for approval**\n"
+              body+=f"Production image (`{repo}:latest` / `:stable`) has been published from the tested staging digest via immutable promotion.\n"
+              body+=f"Reviewer, please approve the **deploy-production** job in the [Actions run]({run_url}) (protected `production` environment) to deploy to production.\n"
           open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if is_failure else 'false'}\nis_success={'true' if is_success else 'false'}\nis_cancelled={'true' if is_cancelled else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
           PY
 
-      - name: Create GitHub Issue (triggers Email — success or failure, same template)
+      - name: Create GitHub Issue (triggers Email 1 — preproduction)
         if: steps.msg.outputs.is_cancelled != 'true'
         uses: actions/github-script@v7
         env:
@@ -505,18 +554,26 @@ jobs:
             const logins=(process.env.LOGINS||'').split(',').filter(Boolean).slice(0,10);
             let body=process.env.BODY;
             const isFailure = process.env.SUBJECT.includes('❌');
-            const labels = isFailure ? ['staging-failure','notify'] : ['staging-success','notify'];
-            try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels}); core.info('Created staging issue — same email for success/failure'); }catch(e){ core.warning(e.message); await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
+            const labels = isFailure ? ['preprod-failure','notify'] : ['preprod-success','notify'];
+            try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels}); core.info('Created preproduction issue — Email 1 sent'); }catch(e){ core.warning(e.message); await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
 
-      - name: Log staging cancelled (no email)
+      - name: Log preproduction cancelled (no email)
         if: steps.msg.outputs.is_cancelled == 'true'
         run: |
-          echo "::notice::Staging cancelled (stale) — no email"
+          echo "::notice::Preproduction cancelled (stale) — no email"
           echo "${{ steps.msg.outputs.body }}"
 
   notify-production:
+    # --------------------------------------------------------------
+    # Email 2 — Production Deployment Result (exactly 1 of 2 custom emails)
+    # Triggers ONLY after deploy-production completes (which waited for
+    # manual approval via protected `production` environment).
+    # Reports success or failure of the actual production deployment.
+    # Depends only on: deploy-production
+    # Replaces old notify-production that depended on both publish+deploy.
+    # --------------------------------------------------------------
     runs-on: ubuntu-latest
-    needs: [publish-production, deploy-production]
+    needs: [deploy-production]
     if: always()
     permissions:
       contents: read
@@ -542,7 +599,7 @@ jobs:
             logins = [...new Set(logins)];
             core.setOutput('logins', logins.join(','));
 
-      - name: Build minimal production message
+      - name: Build production deployment message
         id: msg
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
@@ -554,27 +611,33 @@ jobs:
           repo="${{ github.repository }}"; sha="${{ github.sha }}"[:7]; actor="${{ github.actor }}"; run_url=f"https://github.com/{repo}/actions/runs/${{ github.run_id }}"
           def norm(v): return "success" if v=="success" else "failure" if v=="failure" else "cancelled" if v=="cancelled" else "skipped" if v in ["skipped","cancelled"] else v
           cd={k: norm(v.get("result","skipped")) for k,v in needs.items()}
-          failed=[k for k,v in cd.items() if v=="failure"]
-          cancelled=[k for k,v in needs.items() if v.get("result")=="cancelled"]
-          is_failure=len(failed)>0
-          is_cancelled=len(cancelled)>0 and not is_failure
-          is_success=not is_failure and not is_cancelled
+          # Only deploy-production matters here; publish-production already reported in Email 1
+          deploy_result = cd.get('deploy-production','skipped')
+          raw_result = needs.get('deploy-production',{}).get('result','skipped')
+          is_cancelled = raw_result == 'cancelled'
+          is_skipped = raw_result in ['skipped']
+          is_failure = deploy_result == 'failure'
+          is_success = deploy_result == 'success'
           def icon(s): return "✅" if s=="success" else "❌" if s=="failure" else "⏭️" if s=="skipped" else "⚠️" if s=="cancelled" else "⚠️"
-          table=f"| Prod promote | {icon(cd.get('publish-production','skipped'))} {cd.get('publish-production','skipped')} |\n| Prod deploy | {icon(cd.get('deploy-production','skipped'))} {cd.get('deploy-production','skipped')} |"
-          mermaid="```mermaid\nflowchart LR\n  promote-->deploy\n  promote["+icon(cd.get('publish-production','skipped'))+" promote]\n  deploy["+icon(cd.get('deploy-production','skipped'))+" deploy]\n```"
-          subject=f"[Prod] {'❌ Failure' if is_failure else ('⚠️ Cancelled' if is_cancelled else '✅ Success')} {sha} by {actor}"
-          if is_cancelled:
-              body=f"### ⚠️ Prod Cancelled — `{sha}` by @{actor}\n"
+          table=f"| Production deploy | {icon(deploy_result)} {deploy_result} |"
+          mermaid=f"```mermaid\nflowchart LR\n  deploy[{icon(deploy_result)} deploy]\n```"
+          if is_skipped:
+            subject=f"[Production] ⏭️ Skipped {sha} by {actor}"
+            body=f"### ⏭️ Production Skipped — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n\n_Production deployment was skipped (upstream failure or GHCR-only mode without PROD_HOST)._ \n"
+          elif is_cancelled:
+            subject=f"[Production] ⚠️ Cancelled {sha} by {actor}"
+            body=f"### ⚠️ Production Cancelled — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
           elif is_failure:
-              body=f"### ❌ Prod Failed — `{sha}` by @{actor}\n"
+            subject=f"[Production] ❌ Failure {sha} by {actor}"
+            body=f"### ❌ Production Deployment Failed — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n\n_Production deployment failed after approval — check deploy logs and consider rollback via immutable digest._\n"
           else:
-              body=f"### ✅ Production Deployed — `{sha}` by @{actor}\n"
-          body+=f"\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
-          open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if is_failure else 'false'}\nis_cancelled={'true' if is_cancelled else 'false'}\nis_success={'true' if is_success else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
+            subject=f"[Production] ✅ Success {sha} by {actor}"
+            body=f"### ✅ Production Deployed — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n\n🚀 Production is live.\n"
+          open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if is_failure else 'false'}\nis_cancelled={'true' if is_cancelled else 'false'}\nis_skipped={'true' if is_skipped else 'false'}\nis_success={'true' if is_success else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
           PY
 
-      - name: Create GitHub Issue (triggers Email — success or failure, same template)
-        if: steps.msg.outputs.is_cancelled != 'true'
+      - name: Create GitHub Issue (triggers Email 2 — production result)
+        if: steps.msg.outputs.is_cancelled != 'true' && steps.msg.outputs.is_skipped != 'true'
         uses: actions/github-script@v7
         env:
           SUBJECT: ${{ steps.msg.outputs.subject }}
@@ -586,10 +649,10 @@ jobs:
             let body=process.env.BODY;
             const isFailure = process.env.SUBJECT.includes('❌');
             const labels = isFailure ? ['prod-failure','notify'] : ['prod-success','notify'];
-            try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels}); core.info('Created prod issue — same email for success/failure'); }catch(e){ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
+            try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels}); core.info('Created prod issue — Email 2 sent'); }catch(e){ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
 
-      - name: Log prod cancelled
-        if: steps.msg.outputs.is_cancelled == 'true'
+      - name: Log prod skipped/cancelled (no email)
+        if: steps.msg.outputs.is_cancelled == 'true' || steps.msg.outputs.is_skipped == 'true'
         run: |
-          echo "::notice::Prod cancelled (stale) — no email"
+          echo "::notice::Prod deployment skipped/cancelled — no email (see body)"
           echo "${{ steps.msg.outputs.body }}"
