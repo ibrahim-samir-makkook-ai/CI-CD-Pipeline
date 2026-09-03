@@ -135,14 +135,13 @@ jobs:
               icon="✅" if r=="success" else "❌" if r=="failure" else "⏭️" if r=="skipped" else "⚠️" if r=="cancelled" else "⚠️"
               rows.append(f"| {j} | {icon} {r} |")
           table="\n".join(rows)
-          mermaid="```mermaid\nflowchart LR\n  lint-->test-->docker\n```"
           if is_cancelled:
               body=f"### ⚠️ CI Cancelled — `{sha}` by @{actor}\n"
           elif is_failure:
               body=f"### ❌ CI Failed — `{sha}` by @{actor}\n"
           else:
               body=f"### ✅ CI Passed — `{sha}` by @{actor}\n"
-          body+=f"\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
+          body+=f"\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n"
           open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if is_failure else 'false'}\nis_success={'true' if is_success else 'false'}\nis_cancelled={'true' if is_cancelled else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
           PY
 
