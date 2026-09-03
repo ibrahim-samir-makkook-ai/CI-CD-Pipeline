@@ -203,6 +203,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ needs.publish-staging.outputs.digest }}
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -417,33 +419,38 @@ jobs:
           script: |
             let ci = { lint: 'skipped', test: 'skipped', docker: 'skipped' };
             let found = false;
-            try {
-              const runs = await github.rest.actions.listWorkflowRuns({
-                owner: context.repo.owner, repo: context.repo.repo,
-                workflow_id: 'ci.yml', per_page: 10
-              });
-              const run = runs.data.workflow_runs.find(r => r.head_sha === context.sha);
-              if (run) {
-                core.info(`Found CI run ${run.id} conclusion=${run.conclusion} status=${run.status}`);
-                const jobs = await github.rest.actions.listJobsForWorkflowRun({
-                  owner: context.repo.owner, repo: context.repo.repo, run_id: run.id, per_page: 20
+            // Retry up to 3 times to handle CI workflow still indexing (race between ci.yml and cd.yml on same sha)
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                const runs = await github.rest.actions.listWorkflowRuns({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  workflow_id: 'ci.yml', per_page: 10
                 });
-                for (const j of jobs.data.jobs) {
-                  const n = j.name.toLowerCase();
-                  if (n.includes('lint')) ci.lint = j.conclusion || j.status;
-                  else if (n.includes('test')) ci.test = j.conclusion || j.status;
-                  else if (n.includes('docker')) ci.docker = j.conclusion || j.status;
+                const run = runs.data.workflow_runs.find(r => r.head_sha === context.sha);
+                if (run) {
+                  core.info(`Found CI run ${run.id} attempt ${attempt} conclusion=${run.conclusion} status=${run.status}`);
+                  const jobs = await github.rest.actions.listJobsForWorkflowRun({
+                    owner: context.repo.owner, repo: context.repo.repo, run_id: run.id, per_page: 20
+                  });
+                  for (const j of jobs.data.jobs) {
+                    const n = j.name.toLowerCase();
+                    if (n.includes('lint')) ci.lint = j.conclusion || j.status;
+                    else if (n.includes('test')) ci.test = j.conclusion || j.status;
+                    else if (n.includes('docker')) ci.docker = j.conclusion || j.status;
+                  }
+                  found = true;
+                  break;
+                } else {
+                  core.warning(`CI run not found for sha ${context.sha} attempt ${attempt}/3`);
+                  if (attempt < 3) await new Promise(r => setTimeout(r, 10000));
                 }
-                found = true;
-              } else {
-                core.warning('CI run not found for sha ' + context.sha);
-              }
-            } catch(e) { core.warning('CI fetch failed: ' + e.message); }
+              } catch(e) { core.warning('CI fetch failed attempt ' + attempt + ': ' + e.message); if (attempt < 3) await new Promise(r => setTimeout(r, 10000)); }
+            }
             core.setOutput('lint', ci.lint);
             core.setOutput('test', ci.test);
             core.setOutput('docker', ci.docker);
             core.setOutput('found', String(found));
-            core.info(`CI: ${JSON.stringify(ci)}`);
+            core.info(`CI: ${JSON.stringify(ci)} found=${found}`);
 
       - name: Build minimal staging message
         id: msg
@@ -457,44 +464,33 @@ jobs:
           NEEDS_JSON="$NEEDS_JSON" LOGINS="$LOGINS" CI_LINT="$CI_LINT" CI_TEST="$CI_TEST" CI_DOCKER="$CI_DOCKER" python3 - << 'PY'
           import json, os
           needs=json.loads(os.environ["NEEDS_JSON"])
-          logins=os.environ["LOGINS"]
           ci = {"lint": os.environ["CI_LINT"], "test": os.environ["CI_TEST"], "docker": os.environ["CI_DOCKER"]}
           repo="${{ github.repository }}"; sha="${{ github.sha }}"[:7]; actor="${{ github.actor }}"
           run_url=f"https://github.com/{repo}/actions/runs/${{ github.run_id }}"
-          # normalize
-          def norm(v): return "success" if v=="success" else "failure" if v=="failure" else "skipped" if v in ["skipped","cancelled"] else v
+          def norm(v): return "success" if v=="success" else "failure" if v=="failure" else "cancelled" if v=="cancelled" else "skipped" if v in ["skipped","cancelled"] else v
           ci = {k: norm(v) for k,v in ci.items()}
           cd = {k: norm(v.get("result","skipped")) for k,v in needs.items()}
-          # combined failed check
           failed_ci=[k for k,v in ci.items() if v=="failure"]
           failed_cd=[k for k,v in cd.items() if v=="failure"]
           failed=failed_ci+failed_cd
           cancelled=[k for k,v in {**ci,**cd}.items() if v=="cancelled"] or [k for k,v in needs.items() if v.get("result")=="cancelled"]
           is_failure=len(failed)>0
-          is_success=not is_failure and not cancelled
-          def icon(s): return "✅" if s=="success" else "❌" if s=="failure" else "⏭️" if s=="skipped" else "⚠️"
-          # table
+          is_cancelled=len(cancelled)>0 and not is_failure
+          is_success=not is_failure and not is_cancelled
+          def icon(s): return "✅" if s=="success" else "❌" if s=="failure" else "⏭️" if s=="skipped" else "⚠️" if s=="cancelled" else "⚠️"
           table=f"| CI lint | {icon(ci['lint'])} {ci['lint']} |\n| CI test | {icon(ci['test'])} {ci['test']} |\n| CI docker | {icon(ci['docker'])} {ci['docker']} |\n| Staging build | {icon(cd.get('publish-staging','skipped'))} {cd.get('publish-staging','skipped')} |\n| Staging deploy | {icon(cd.get('deploy-staging','skipped'))} {cd.get('deploy-staging','skipped')} |"
-          # mermaid with highlight
-          def style(n, s): return f"  {n}:::fail" if s=="failure" else f"  {n}"
           mermaid="```mermaid\nflowchart LR\n  lint-->test-->docker-->staging_build-->staging_deploy\n"
           mermaid+=f"  lint[{icon(ci['lint'])} lint]\n  test[{icon(ci['test'])} test]\n  docker[{icon(ci['docker'])} docker]\n  staging_build[{icon(cd.get('publish-staging','skipped'))} build]\n  staging_deploy[{icon(cd.get('deploy-staging','skipped'))} deploy]\n"
           mermaid+="  classDef fail fill:#ffcccc,stroke:#cc0000\n```"
-          causes=[]
-          if "lint" in failed_ci: causes.append("• CI lint: `ruff check` failed — fix formatting")
-          if "test" in failed_ci: causes.append("• CI test: `pytest` failed — check app.py")
-          if "docker" in failed_ci: causes.append("• CI docker: build/health failed")
-          if "publish-staging" in failed_cd: causes.append("• Staging build: Docker push/smoke `curl /health` failed")
-          if "deploy-staging" in failed_cd: causes.append("• Staging deploy: SSH `STAGING_HOST` healthcheck failed")
-          if not causes and is_failure: causes.append("• Unknown failure — check Run logs")
-          subject=f"[Staging] {'❌ Failure' if is_failure else '✅ Success'} {sha} by {actor} — {','.join(failed) if failed else 'CI+Staging OK'}"
-          body=f"### {'❌ Staging Failed' if is_failure else '✅ Staging Passed'} — `{sha}` by @{actor}\n"
-          body+=f"**Run:** [#{os.environ.get('GITHUB_RUN_ID','')}]" f"({run_url}) | **Commit:** `{sha}`\n\n"
-          body+=f"| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
-          if causes: body+="\n**Causes:**\n"+"\n".join(causes)+"\n"
-          body+=f"\nCC: {', '.join('@'+l for l in logins.split(',') if l)}\n"
-          body+="\n---\n*One email for CI+CD staging — GitHub Issue triggers email to reviewers/assignees.*\n"
-          open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if is_failure else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
+          subject=f"[Staging] {'❌ Failure' if is_failure else ('⚠️ Cancelled' if is_cancelled else '✅ Success')} {sha} by {actor}"
+          if is_cancelled:
+              body=f"### ⚠️ Staging Cancelled — `{sha}` by @{actor}\n"
+          elif is_failure:
+              body=f"### ❌ Staging Failed — `{sha}` by @{actor}\n"
+          else:
+              body=f"### ✅ Staging Passed — `{sha}` by @{actor}\n"
+          body+=f"\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
+          open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if is_failure else 'false'}\nis_success={'true' if is_success else 'false'}\nis_cancelled={'true' if is_cancelled else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
           PY
 
       - name: Create GitHub Issue — Staging Failure (triggers Email)
@@ -507,13 +503,31 @@ jobs:
         with:
           script: |
             const logins=(process.env.LOGINS||'').split(',').filter(Boolean).slice(0,10);
-            let body=process.env.BODY+`\n\nCC: ${logins.map(l=>'@'+l).join(' ')}`;
+            let body=process.env.BODY;
             try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels:['staging-failure','notify']}); core.info('Created staging failure issue'); }catch(e){ core.warning(e.message); await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
 
-      - name: Log staging success — no email (Failure + prod success)
-        if: steps.msg.outputs.is_failure == 'false'
+      - name: Create GitHub Issue — Staging Success Ack (auto-closed, triggers Email)
+        if: steps.msg.outputs.is_success == 'true'
+        uses: actions/github-script@v7
+        env:
+          SUBJECT: ${{ steps.msg.outputs.subject }}
+          BODY: ${{ steps.msg.outputs.body }}
+          LOGINS: ${{ steps.reviewers.outputs.logins }}
+        with:
+          script: |
+            const logins=(process.env.LOGINS||'').split(',').filter(Boolean).slice(0,10);
+            let body=process.env.BODY;
+            const labels=['staging-success','notify'];
+            try{
+              const {data}=await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels});
+              await github.rest.issues.update({owner:context.repo.owner, repo:context.repo.repo, issue_number:data.number, state:'closed'});
+              core.info('Created staging success issue #'+data.number+' (closed, email sent) — Mail #1');
+            }catch(e){ core.warning(e.message); const {data}=await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); await github.rest.issues.update({owner:context.repo.owner, repo:context.repo.repo, issue_number:data.number, state:'closed'}); }
+
+      - name: Log staging cancelled (no email)
+        if: steps.msg.outputs.is_cancelled == 'true'
         run: |
-          echo "::notice::Staging passed — no email (per Failure + prod success policy)"
+          echo "::notice::Staging cancelled (stale) — no email"
           echo "${{ steps.msg.outputs.body }}"
 
   notify-production:
@@ -553,34 +567,25 @@ jobs:
           NEEDS_JSON="$NEEDS_JSON" LOGINS="$LOGINS" python3 - << 'PY'
           import json, os
           needs=json.loads(os.environ["NEEDS_JSON"])
-          logins=os.environ["LOGINS"]
           repo="${{ github.repository }}"; sha="${{ github.sha }}"[:7]; actor="${{ github.actor }}"; run_url=f"https://github.com/{repo}/actions/runs/${{ github.run_id }}"
-          def norm(v): return "success" if v=="success" else "failure" if v=="failure" else "skipped" if v in ["skipped","cancelled"] else v
+          def norm(v): return "success" if v=="success" else "failure" if v=="failure" else "cancelled" if v=="cancelled" else "skipped" if v in ["skipped","cancelled"] else v
           cd={k: norm(v.get("result","skipped")) for k,v in needs.items()}
           failed=[k for k,v in cd.items() if v=="failure"]
           cancelled=[k for k,v in needs.items() if v.get("result")=="cancelled"]
           is_failure=len(failed)>0
           is_cancelled=len(cancelled)>0 and not is_failure
           is_success=not is_failure and not is_cancelled
-          def icon(s): return "✅" if s=="success" else "❌" if s=="failure" else "⏭️" if s=="skipped" else "⚠️"
+          def icon(s): return "✅" if s=="success" else "❌" if s=="failure" else "⏭️" if s=="skipped" else "⚠️" if s=="cancelled" else "⚠️"
           table=f"| Prod promote | {icon(cd.get('publish-production','skipped'))} {cd.get('publish-production','skipped')} |\n| Prod deploy | {icon(cd.get('deploy-production','skipped'))} {cd.get('deploy-production','skipped')} |"
           mermaid="```mermaid\nflowchart LR\n  promote-->deploy\n  promote["+icon(cd.get('publish-production','skipped'))+" promote]\n  deploy["+icon(cd.get('deploy-production','skipped'))+" deploy]\n```"
-          causes=[]
-          if "publish-production" in failed: causes.append("• Prod promote: stale guard or imagetools failed — approve latest")
-          if "deploy-production" in failed: causes.append("• Prod deploy: SSH `PROD_HOST` healthcheck failed")
-          if cancelled: causes.append(f"• Cancelled stale: {', '.join([k for k,v in needs.items() if v.get('result')=='cancelled'])}")
-          digest=needs.get("publish-production",{}).get("outputs",{}).get("digest","") or "n/a"
-          # try get digest from staging run if available via API? fallback n/a
-          subject=f"[Prod] {'❌ Failure' if is_failure else ('⚠️ Cancelled' if is_cancelled else '✅ Success')} {sha} by {actor} — {','.join(failed) if failed else 'production deployed'}"
-          body=f"### {'❌ Prod Failed' if is_failure else ('⚠️ Prod Cancelled' if is_cancelled else '✅ Production Deployed')} — `{sha}` by @{actor}\n"
-          body+=f"**Run:** [#{os.environ.get('GITHUB_RUN_ID','')}]" f"({run_url}) | **Commit:** `{sha}`\n\n"
-          body+=f"| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
-          if causes: body+="\n**Causes:**\n"+"\n".join(causes)+"\n"
-          if is_success:
-              body+=f"\n**Digest:** `{digest}`\n**Images:** `ghcr.io/...:staging` → `:latest/:stable`\n"
-              body+=f"**Rollback:** `docker buildx imagetools create --tag ghcr.io/{repo}:latest ghcr.io/{repo}@<digest>`\n"
-          body+=f"\nCC: {', '.join('@'+l for l in logins.split(',') if l)}\n"
-          body+="\n---\n*After approval — GitHub Issue triggers email to reviewers.*\n"
+          subject=f"[Prod] {'❌ Failure' if is_failure else ('⚠️ Cancelled' if is_cancelled else '✅ Success')} {sha} by {actor}"
+          if is_cancelled:
+              body=f"### ⚠️ Prod Cancelled — `{sha}` by @{actor}\n"
+          elif is_failure:
+              body=f"### ❌ Prod Failed — `{sha}` by @{actor}\n"
+          else:
+              body=f"### ✅ Production Deployed — `{sha}` by @{actor}\n"
+          body+=f"\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
           open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if is_failure else 'false'}\nis_cancelled={'true' if is_cancelled else 'false'}\nis_success={'true' if is_success else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
           PY
 
@@ -594,7 +599,7 @@ jobs:
         with:
           script: |
             const logins=(process.env.LOGINS||'').split(',').filter(Boolean).slice(0,10);
-            let body=process.env.BODY+`\n\nCC: ${logins.map(l=>'@'+l).join(' ')}`;
+            let body=process.env.BODY;
             try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels:['prod-failure','notify']}); }catch(e){ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
 
       - name: Create GitHub Issue — Prod Success Ack (auto-closed)
@@ -607,7 +612,7 @@ jobs:
         with:
           script: |
             const logins=(process.env.LOGINS||'').split(',').filter(Boolean).slice(0,10);
-            let body=process.env.BODY+`\n\nCC: ${logins.map(l=>'@'+l).join(' ')}`;
+            let body=process.env.BODY;
             const labels=['prod-success','notify'];
             try{
               const {data}=await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels});

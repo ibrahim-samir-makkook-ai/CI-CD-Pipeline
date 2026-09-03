@@ -125,12 +125,9 @@ jobs:
           NEEDS_JSON="$NEEDS_JSON" LOGINS="$LOGINS" python3 - << 'PY'
           import json, os
           needs=json.loads(os.environ["NEEDS_JSON"])
-          logins=os.environ["LOGINS"]
           repo="${{ github.repository }}"; sha="${{ github.sha }}"[:7]; actor="${{ github.actor }}"; run_url=f"https://github.com/{repo}/actions/runs/${{ github.run_id }}"
           failed=[k for k,v in needs.items() if v["result"]=="failure"]
-          # minimal subject
-          subject=f"[CI] {'❌ Failure' if failed else '✅ Success'} {sha} by {actor} — {','.join(failed) if failed else 'PR ready'}"
-          # simple table
+          subject=f"[CI] {'❌ Failure' if failed else '✅ Success'} {sha} by {actor}"
           rows=[]
           for j in ["lint","test","docker"]:
               r=needs.get(j,{}).get("result","skipped")
@@ -138,13 +135,7 @@ jobs:
               rows.append(f"| {j} | {icon} {r} |")
           table="\n".join(rows)
           mermaid="```mermaid\nflowchart LR\n  lint-->test-->docker\n```"
-          causes=[]
-          if "lint" in failed: causes.append("• lint: `ruff check` failed — fix style")
-          if "test" in failed: causes.append("• test: `pytest` failed — check app.py")
-          if "docker" in failed: causes.append("• docker: build/health failed")
-          body=f"### {'❌ CI Failed' if failed else '✅ CI Passed'} — PR\n**Commit:** `{sha}` by @{actor} | [Run]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
-          if causes: body+="\n**Causes:**\n"+"\n".join(causes)+"\n"
-          body+=f"\nCC: {', '.join('@'+l for l in logins.split(',') if l)}\n"
+          body=f"### {'❌ CI Failed' if failed else '✅ CI Passed'} — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
           open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if failed else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
           PY
 
@@ -158,5 +149,5 @@ jobs:
         with:
           script: |
             const logins=process.env.LOGINS.split(',').filter(Boolean).slice(0,10);
-            let body=process.env.BODY+`\n\nCC: ${logins.map(l=>'@'+l).join(' ')}`;
+            let body=process.env.BODY;
             try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels:['ci-failure','notify']}); }catch(e){ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
