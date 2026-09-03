@@ -172,9 +172,9 @@ jobs:
             echo "$TOKEN" | $DOCKER login ghcr.io -u "${{ github.actor }}" --password-stdin
             echo "Pulling $IMAGE"
             $DOCKER pull "$IMAGE"
-            # Port from secrets or variables (generic, same-server needs different ports)
+            # Port/Path from secrets or variables (generic, same-server needs different ports/paths)
             STAGING_PORT="${{ secrets.STAGING_PORT || vars.STAGING_PORT || 5000 }}"
-            STAGING_PATH="${{ secrets.STAGING_PATH || '/opt/ci-cd-pipeline' }}"
+            STAGING_PATH="${{ secrets.STAGING_PATH || vars.STAGING_PATH || '/opt/ci-cd-pipeline' }}"
             [ -z "$STAGING_PATH" ] && STAGING_PATH="/opt/ci-cd-pipeline"
             [ -z "$STAGING_PORT" ] && STAGING_PORT="5000"
             echo "Staging config: STAGING_PORT=$STAGING_PORT STAGING_PATH=$STAGING_PATH"
@@ -386,9 +386,9 @@ jobs:
             echo "$TOKEN" | $DOCKER login ghcr.io -u "${{ github.actor }}" --password-stdin
             echo "Pulling $IMAGE"
             $DOCKER pull "$IMAGE"
-            # Port from secrets or variables (generic, same-server needs different ports; prod defaults to 5001)
+            # Port/Path from secrets or variables (generic, same-server needs different ports/paths)
             PROD_PORT="${{ secrets.PROD_PORT || vars.PROD_PORT || 5001 }}"
-            PROD_PATH="${{ secrets.PROD_PATH || '/opt/ci-cd-pipeline-prod' }}"
+            PROD_PATH="${{ secrets.PROD_PATH || vars.PROD_PATH || '/opt/ci-cd-pipeline-prod' }}"
             [ -z "$PROD_PATH" ] && PROD_PATH="/opt/ci-cd-pipeline-prod"
             [ -z "$PROD_PORT" ] && PROD_PORT="5001"
             echo "Prod config: PROD_PORT=$PROD_PORT PROD_PATH=$PROD_PATH"
