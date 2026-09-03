@@ -187,6 +187,13 @@ jobs:
               printf '%s\n' 'services:' '  app:' '    image: ghcr.io/ibrahim-samir-makkook-ai/ci-cd-pipeline:${TAG:-staging}' "    ports: [\"$STAGING_PORT:5000\"]" '    container_name: ci-cd-pipeline-test' '    restart: unless-stopped' '    healthcheck:' '      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('\''http://localhost:5000/health'\'')"]' '      interval: 10s' '      timeout: 3s' '      retries: 3' '      start_period: 5s' > docker-compose.yml
               echo "Created docker-compose.yml:"
               cat docker-compose.yml
+            else
+              # Patch existing compose for same-server migration (ensure host port matches STAGING_PORT)
+              if grep -q 'ports:' docker-compose.yml && ! grep -q "\"$STAGING_PORT:5000\"" docker-compose.yml; then
+                echo "Patching existing docker-compose.yml host port to $STAGING_PORT"
+                sed -i -E "s/\"[0-9]+:5000\"/\"$STAGING_PORT:5000\"/g" docker-compose.yml || true
+                cat docker-compose.yml
+              fi
             fi
             $COMPOSE config >/dev/null && echo "compose valid" || (echo "::error::compose invalid"; cat docker-compose.yml || true; exit 1)
             echo "Deploying with docker compose (cleaning stale port $STAGING_PORT)"
@@ -394,7 +401,22 @@ jobs:
               printf '%s\n' 'services:' '  app:' '    image: ghcr.io/ibrahim-samir-makkook-ai/ci-cd-pipeline:${TAG:-stable}' "    ports: [\"$PROD_PORT:5000\"]" '    container_name: ci-cd-pipeline-prod' '    restart: unless-stopped' '    healthcheck:' '      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('\''http://localhost:5000/health'\'')"]' '      interval: 10s' '      timeout: 3s' '      retries: 3' '      start_period: 5s' > docker-compose.yml
               echo "Created docker-compose.yml:"
               cat docker-compose.yml
+            else
+              # Patch existing compose for same-server migration (ensure host port/container_name match prod)
+              if grep -q 'ports:' docker-compose.yml && ! grep -q "\"$PROD_PORT:5000\"" docker-compose.yml; then
+                echo "Patching existing docker-compose.yml host port to $PROD_PORT"
+                sed -i -E "s/\"[0-9]+:5000\"/\"$PROD_PORT:5000\"/g" docker-compose.yml || true
+                cat docker-compose.yml
+              fi
+              if ! grep -q "container_name: ci-cd-pipeline-prod" docker-compose.yml; then
+                echo "Patching container_name to ci-cd-pipeline-prod"
+                sed -i "s/container_name: ci-cd-pipeline-test/container_name: ci-cd-pipeline-prod/g" docker-compose.yml || true
+                sed -i "s/container_name: ci-cd-pipeline-staging/container_name: ci-cd-pipeline-prod/g" docker-compose.yml || true
+                cat docker-compose.yml
+              fi
             fi
+            echo "Using compose file:"
+            cat docker-compose.yml
             $COMPOSE config >/dev/null && echo "compose valid" || (echo "::error::compose invalid"; cat docker-compose.yml || true; exit 1)
             echo "Deploying production with docker compose (cleaning stale port $PROD_PORT)"
             TAG=stable $COMPOSE down 2>/dev/null || true
