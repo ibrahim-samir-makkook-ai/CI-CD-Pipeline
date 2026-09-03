@@ -85,3 +85,84 @@ jobs:
           curl --fail http://localhost:5000/ || (docker logs test-container && exit 1)
           docker stop test-container
           docker rm test-container
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [lint, test, docker]
+    if: always() && github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Resolve reviewers
+        id: reviewers
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            let logins = [];
+            try {
+              const env = await github.rest.repos.getEnvironment({
+                owner: context.repo.owner, repo: context.repo.repo, environment_name: 'production'
+              });
+              for (const r of (env.data.protection_rules || [])) for (const rev of (r.reviewers || [])) {
+                const v = rev.reviewer; if (v?.login) logins.push(v.login);
+                else if (v?.slug) { try { const ms = await github.rest.teams.listMembersInOrg({ org: context.repo.owner, team_slug: v.slug }); ms.data.forEach(m => logins.push(m.login)); } catch(e){ logins.push(v.slug); } }
+              }
+            } catch(e) { core.warning(e.message); }
+            if (!logins.length) logins = [context.repo.owner];
+            logins = [...new Set(logins)];
+            core.setOutput('logins', logins.join(','));
+
+      - name: Build minimal message
+        id: msg
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          NEEDS_JSON="$NEEDS_JSON" python3 - << 'PY'
+          import json, os
+          needs=json.loads(os.environ["NEEDS_JSON"])
+          repo="${{ github.repository }}"; sha="${{ github.sha }}"[:7]; actor="${{ github.actor }}"; run_url=f"https://github.com/{repo}/actions/runs/${{ github.run_id }}"
+          failed=[k for k,v in needs.items() if v["result"]=="failure"]
+          cancelled=[k for k,v in needs.items() if v.get("result")=="cancelled"]
+          is_failure=len(failed)>0
+          is_cancelled=len(cancelled)>0 and not is_failure
+          is_success=not is_failure and not is_cancelled
+          subject=f"[CI] {'❌ Failure' if is_failure else ('⚠️ Cancelled' if is_cancelled else '✅ Success')} {sha} by {actor}"
+          rows=[]
+          for j in ["lint","test","docker"]:
+              r=needs.get(j,{}).get("result","skipped")
+              icon="✅" if r=="success" else "❌" if r=="failure" else "⏭️" if r=="skipped" else "⚠️" if r=="cancelled" else "⚠️"
+              rows.append(f"| {j} | {icon} {r} |")
+          table="\n".join(rows)
+          mermaid="```mermaid\nflowchart LR\n  lint-->test-->docker\n```"
+          if is_cancelled:
+              body=f"### ⚠️ CI Cancelled — `{sha}` by @{actor}\n"
+          elif is_failure:
+              body=f"### ❌ CI Failed — `{sha}` by @{actor}\n"
+          else:
+              body=f"### ✅ CI Passed — `{sha}` by @{actor}\n"
+          body+=f"\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
+          open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if is_failure else 'false'}\nis_success={'true' if is_success else 'false'}\nis_cancelled={'true' if is_cancelled else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
+          PY
+
+      - name: Create Issue (triggers Email — success or failure, same template)
+        if: steps.msg.outputs.is_cancelled != 'true'
+        uses: actions/github-script@v7
+        env:
+          SUBJECT: ${{ steps.msg.outputs.subject }}
+          BODY: ${{ steps.msg.outputs.body }}
+          LOGINS: ${{ steps.reviewers.outputs.logins }}
+        with:
+          script: |
+            const logins=(process.env.LOGINS||'').split(',').filter(Boolean).slice(0,10);
+            let body=process.env.BODY;
+            const isFailure = process.env.SUBJECT.includes('❌');
+            const labels = isFailure ? ['ci-failure','notify'] : ['ci-success','notify'];
+            try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels}); core.info('Created CI issue — same email for success/failure'); }catch(e){ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
+
+      - name: Log cancelled
+        if: steps.msg.outputs.is_cancelled == 'true'
+        run: |
+          echo "::notice::CI cancelled — no email"
+          echo "${{ steps.msg.outputs.body }}"
