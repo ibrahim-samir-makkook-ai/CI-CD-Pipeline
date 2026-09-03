@@ -421,7 +421,6 @@ jobs:
             echo "Deploying production with docker compose (cleaning stale port $PROD_PORT)"
             TAG=stable $COMPOSE down 2>/dev/null || true
             $DOCKER rm -f ci-cd-pipeline-prod 2>/dev/null || echo "$SUDO_PASS" | sudo -S docker rm -f ci-cd-pipeline-prod 2>/dev/null || true
-            $DOCKER rm -f ci-cd-pipeline-test 2>/dev/null || echo "$SUDO_PASS" | sudo -S docker rm -f ci-cd-pipeline-test 2>/dev/null || true
             $DOCKER ps -q --filter publish=$PROD_PORT | xargs -r $DOCKER rm -f 2>/dev/null || $DOCKER ps -q --filter publish=$PROD_PORT | xargs -r echo "$SUDO_PASS" | sudo -S docker rm -f 2>/dev/null || true
             echo "$SUDO_PASS" | sudo -S fuser -k $PROD_PORT/tcp 2>/dev/null || sudo -n fuser -k $PROD_PORT/tcp 2>/dev/null || true
             TAG=stable $COMPOSE pull
