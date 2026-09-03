@@ -86,68 +86,68 @@ jobs:
           docker stop test-container
           docker rm test-container
 
-  notify:
-    runs-on: ubuntu-latest
-    needs: [lint, test, docker]
-    # One email for CI+CD: on push to main, CD's notify-staging covers CI+CD staging (so silence here to avoid duplicate).
-    # This job only emails for PRs where CD does not run.
-    if: always()
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - name: Resolve reviewers
-        id: reviewers
-        uses: actions/github-script@v7
-        with:
-          result-encoding: string
-          script: |
-            let logins = [];
-            try {
-              const env = await github.rest.repos.getEnvironment({
-                owner: context.repo.owner, repo: context.repo.repo, environment_name: 'production'
-              });
-              for (const r of (env.data.protection_rules || [])) for (const rev of (r.reviewers || [])) {
-                const v = rev.reviewer; if (v?.login) logins.push(v.login);
-                else if (v?.slug) { try { const ms = await github.rest.teams.listMembersInOrg({ org: context.repo.owner, team_slug: v.slug }); ms.data.forEach(m => logins.push(m.login)); } catch(e){ logins.push(v.slug); } }
-              }
-            } catch(e) { core.warning(e.message); }
-            if (!logins.length) logins = [context.repo.owner];
-            logins = [...new Set(logins)];
-            core.setOutput('logins', logins.join(','));
+  # notify:
+  #   runs-on: ubuntu-latest
+  #   needs: [lint, test, docker]
+  #   # One email for CI+CD: on push to main, CD's notify-staging covers CI+CD staging (so silence here to avoid duplicate).
+  #   # This job only emails for PRs where CD does not run.
+  #   if: always()
+  #   permissions:
+  #     contents: read
+  #     issues: write
+  #   steps:
+  #     - name: Resolve reviewers
+  #       id: reviewers
+  #       uses: actions/github-script@v7
+  #       with:
+  #         result-encoding: string
+  #         script: |
+  #           let logins = [];
+  #           try {
+  #             const env = await github.rest.repos.getEnvironment({
+  #               owner: context.repo.owner, repo: context.repo.repo, environment_name: 'production'
+  #             });
+  #             for (const r of (env.data.protection_rules || [])) for (const rev of (r.reviewers || [])) {
+  #               const v = rev.reviewer; if (v?.login) logins.push(v.login);
+  #               else if (v?.slug) { try { const ms = await github.rest.teams.listMembersInOrg({ org: context.repo.owner, team_slug: v.slug }); ms.data.forEach(m => logins.push(m.login)); } catch(e){ logins.push(v.slug); } }
+  #             }
+  #           } catch(e) { core.warning(e.message); }
+  #           if (!logins.length) logins = [context.repo.owner];
+  #           logins = [...new Set(logins)];
+  #           core.setOutput('logins', logins.join(','));
 
-      - name: Build minimal message
-        id: msg
-        env:
-          NEEDS_JSON: ${{ toJson(needs) }}
-          LOGINS: ${{ steps.reviewers.outputs.logins }}
-        run: |
-          NEEDS_JSON="$NEEDS_JSON" LOGINS="$LOGINS" python3 - << 'PY'
-          import json, os
-          needs=json.loads(os.environ["NEEDS_JSON"])
-          repo="${{ github.repository }}"; sha="${{ github.sha }}"[:7]; actor="${{ github.actor }}"; run_url=f"https://github.com/{repo}/actions/runs/${{ github.run_id }}"
-          failed=[k for k,v in needs.items() if v["result"]=="failure"]
-          subject=f"[CI] {'❌ Failure' if failed else '✅ Success'} {sha} by {actor}"
-          rows=[]
-          for j in ["lint","test","docker"]:
-              r=needs.get(j,{}).get("result","skipped")
-              icon="✅" if r=="success" else "❌" if r=="failure" else "⏭️" if r=="skipped" else "⚠️"
-              rows.append(f"| {j} | {icon} {r} |")
-          table="\n".join(rows)
-          mermaid="```mermaid\nflowchart LR\n  lint-->test-->docker\n```"
-          body=f"### {'❌ CI Failed' if failed else '✅ CI Passed'} — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
-          open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if failed else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
-          PY
+  #     - name: Build minimal message
+  #       id: msg
+  #       env:
+  #         NEEDS_JSON: ${{ toJson(needs) }}
+  #         LOGINS: ${{ steps.reviewers.outputs.logins }}
+  #       run: |
+  #         NEEDS_JSON="$NEEDS_JSON" LOGINS="$LOGINS" python3 - << 'PY'
+  #         import json, os
+  #         needs=json.loads(os.environ["NEEDS_JSON"])
+  #         repo="${{ github.repository }}"; sha="${{ github.sha }}"[:7]; actor="${{ github.actor }}"; run_url=f"https://github.com/{repo}/actions/runs/${{ github.run_id }}"
+  #         failed=[k for k,v in needs.items() if v["result"]=="failure"]
+  #         subject=f"[CI] {'❌ Failure' if failed else '✅ Success'} {sha} by {actor}"
+  #         rows=[]
+  #         for j in ["lint","test","docker"]:
+  #             r=needs.get(j,{}).get("result","skipped")
+  #             icon="✅" if r=="success" else "❌" if r=="failure" else "⏭️" if r=="skipped" else "⚠️"
+  #             rows.append(f"| {j} | {icon} {r} |")
+  #         table="\n".join(rows)
+  #         mermaid="```mermaid\nflowchart LR\n  lint-->test-->docker\n```"
+  #         body=f"### {'❌ CI Failed' if failed else '✅ CI Passed'} — `{sha}` by @{actor}\n\n🔗 [View progress]({run_url})\n\n| Stage | Status |\n|-------|--------|\n{table}\n\n{mermaid}\n"
+  #         open(os.environ["GITHUB_OUTPUT"],"a").write(f"is_failure={'true' if failed else 'false'}\nsubject={subject}\nbody<<__B__\n{body}\n__B__\n")
+  #         PY
 
-      - name: Create Issue (PR)
-        if: steps.msg.outputs.is_failure == 'true'
-        uses: actions/github-script@v7
-        env:
-          SUBJECT: ${{ steps.msg.outputs.subject }}
-          BODY: ${{ steps.msg.outputs.body }}
-          LOGINS: ${{ steps.reviewers.outputs.logins }}
-        with:
-          script: |
-            const logins=process.env.LOGINS.split(',').filter(Boolean).slice(0,10);
-            let body=process.env.BODY;
-            try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels:['ci-failure','notify']}); }catch(e){ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
+  #     - name: Create Issue (PR)
+  #       if: steps.msg.outputs.is_failure == 'true'
+  #       uses: actions/github-script@v7
+  #       env:
+  #         SUBJECT: ${{ steps.msg.outputs.subject }}
+  #         BODY: ${{ steps.msg.outputs.body }}
+  #         LOGINS: ${{ steps.reviewers.outputs.logins }}
+  #       with:
+  #         script: |
+  #           const logins=process.env.LOGINS.split(',').filter(Boolean).slice(0,10);
+  #           let body=process.env.BODY;
+  #           try{ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins, labels:['ci-failure','notify']}); }catch(e){ await github.rest.issues.create({owner:context.repo.owner, repo:context.repo.repo, title:process.env.SUBJECT, body, assignees:logins}); }
